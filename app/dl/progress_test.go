@@ -33,6 +33,7 @@ func (fakePeer) VisibleName() string { return "test peer" }
 
 type logWriter struct {
 	pw.Writer
+	mu    sync.Mutex
 	lines []string
 }
 
@@ -40,6 +41,8 @@ func (w *logWriter) Log(msg string, args ...any) {
 	if len(args) != 0 {
 		msg = fmt.Sprintf(msg, args...)
 	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
 	w.lines = append(w.lines, msg)
 }
 
@@ -47,16 +50,16 @@ func setupProgressTest(t *testing.T, w pw.Writer) (*progress, *iter, *iterElem, 
 	t.Helper()
 	it := &iter{mu: &sync.Mutex{}, finished: map[int]struct{}{}}
 	p := newProgress(w, it, Options{})
-	elem := newProgressTestElem(t)
+	elem := newProgressTestElem(t, t.TempDir(), "a.bin")
 	p.OnAdd(elem)
 	tracker, ok := p.trackers.Load(elem.id)
 	require.True(t, ok)
 	return p, it, elem, tracker.(*pw.Tracker)
 }
 
-func newProgressTestElem(t *testing.T) *iterElem {
+func newProgressTestElem(t *testing.T, dir, name string) *iterElem {
 	t.Helper()
-	to, err := os.Create(filepath.Join(t.TempDir(), "a.bin.tmp"))
+	to, err := os.Create(filepath.Join(dir, name+tempExt))
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = to.Close() })
 
@@ -64,7 +67,7 @@ func newProgressTestElem(t *testing.T) *iterElem {
 		id:         1,
 		logicalPos: 7,
 		to:         to,
-		file:       &tmedia.Media{Name: "a.bin", Size: 1 << 20},
+		file:       &tmedia.Media{Name: name, Size: 1 << 20},
 		fromMsg:    &tg.Message{ID: 1},
 		from:       fakePeer{},
 	}
@@ -124,6 +127,20 @@ func TestOnDownloadUnknownSize(t *testing.T) {
 	assert.False(t, tracker.IsDone())
 }
 
+func TestOnDoneSuccessWithOneByte(t *testing.T) {
+	p, _, elem, tracker := setupProgressTest(t, pw.NewWriter())
+	elem.file.Size = 1
+	p.OnDownload(elem, downloader.ProgressState{Downloaded: 1, Total: 1})
+	assert.EqualValues(t, 0, tracker.Value())
+	assert.False(t, tracker.IsDone())
+	p.OnDone(elem, nil)
+
+	assert.True(t, tracker.IsDone())
+	assert.False(t, tracker.IsErrored())
+	assert.EqualValues(t, 1, tracker.Value())
+	assert.EqualValues(t, 1, tracker.Total)
+}
+
 func TestOnDoneSuccessUsesDownloadedBytes(t *testing.T) {
 	p, _, elem, tracker := setupProgressTest(t, pw.NewWriter())
 	p.OnDownload(elem, downloader.ProgressState{Downloaded: 5, Total: elem.file.Size})
@@ -143,7 +160,7 @@ func TestOnDoneFailureAfterAllBytesStillErrors(t *testing.T) {
 	assert.True(t, tracker.IsErrored())
 	assert.NotContains(t, it.Finished(), 7)
 	assert.NoFileExists(t, elem.to.Name())
-	assert.Zero(t, p.failed.Load())
+	assert.NoError(t, p.err())
 }
 
 func TestOnDoneRenameFailureNotFinished(t *testing.T) {
@@ -156,7 +173,7 @@ func TestOnDoneRenameFailureNotFinished(t *testing.T) {
 	assert.True(t, tracker.IsErrored())
 	assert.NotContains(t, it.Finished(), 7)
 	assert.FileExists(t, elem.to.Name())
-	assert.EqualValues(t, 1, p.failed.Load())
+	assert.ErrorContains(t, p.err(), "1 file(s) failed after download")
 	require.Len(t, w.lines, 1)
 	assert.Contains(t, w.lines[0], "rename file")
 }
@@ -184,15 +201,15 @@ func TestOnDoneCloseError(t *testing.T) {
 			assert.Contains(t, w.lines[0], "close file")
 			switch test.err {
 			case nil:
-				assert.EqualValues(t, 1, p.failed.Load())
+				assert.ErrorContains(t, p.err(), "1 file(s) failed after download")
 			case io.ErrUnexpectedEOF:
 				assert.Contains(t, w.lines[0], test.err.Error())
-				assert.Zero(t, p.failed.Load())
+				assert.NoError(t, p.err())
 			default:
 				assert.Contains(t, w.lines[0], "error: close file")
 				assert.NotContains(t, w.lines[0], test.err.Error())
 				assert.NotContains(t, w.lines[0], context.Canceled.Error())
-				assert.Zero(t, p.failed.Load())
+				assert.NoError(t, p.err())
 			}
 		})
 	}
@@ -212,8 +229,11 @@ func TestOnDoneChtimesFailureStillFinishes(t *testing.T) {
 	assert.False(t, tracker.IsErrored())
 	assert.Contains(t, it.Finished(), 7)
 	assert.NoError(t, p.err())
+	assert.FileExists(t, filepath.Join(filepath.Dir(elem.to.Name()), elem.file.Name))
+	assert.NoFileExists(t, elem.to.Name())
 	require.Len(t, w.lines, 1)
 	assert.Contains(t, w.lines[0], "set file time")
+	assert.NotContains(t, w.lines[0], " error: ")
 }
 
 func TestOnDoneCancelLetsProgressWaitReturn(t *testing.T) {

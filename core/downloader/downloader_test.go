@@ -25,6 +25,7 @@ type fakeIter struct {
 	elems         []Elem
 	next          int
 	waitBeforeEnd <-chan struct{}
+	recordCancel  bool
 	err           error
 }
 
@@ -37,6 +38,9 @@ func (i *fakeIter) Next(ctx context.Context) bool {
 		select {
 		case <-i.waitBeforeEnd:
 		case <-ctx.Done():
+			if i.recordCancel {
+				i.err = ctx.Err()
+			}
 		}
 	}
 	return false
@@ -77,22 +81,40 @@ type doneResult struct {
 	err  error
 }
 
-type fakeProgress chan doneResult
-
-func (fakeProgress) OnAdd(Elem) {}
-
-func (fakeProgress) OnDownload(Elem, ProgressState) {}
-
-func (p fakeProgress) OnDone(elem Elem, err error) {
-	p <- doneResult{elem: elem, err: err}
+type fakeProgress struct {
+	done  chan doneResult
+	extra atomic.Int32
 }
 
-func (p fakeProgress) doneError(t *testing.T) error {
+func newFakeProgress(t *testing.T, expected int) *fakeProgress {
 	t.Helper()
-	if len(p) != 1 {
-		t.Fatalf("OnDone called %d times, want 1", len(p))
+	p := &fakeProgress{done: make(chan doneResult, expected)}
+	t.Cleanup(func() {
+		if extra := p.extra.Load(); extra != 0 {
+			t.Errorf("OnDone called %d extra times", extra)
+		}
+	})
+	return p
+}
+
+func (*fakeProgress) OnAdd(Elem) {}
+
+func (*fakeProgress) OnDownload(Elem, ProgressState) {}
+
+func (p *fakeProgress) OnDone(elem Elem, err error) {
+	select {
+	case p.done <- doneResult{elem: elem, err: err}:
+	default:
+		p.extra.Add(1)
 	}
-	return (<-p).err
+}
+
+func (p *fakeProgress) doneError(t *testing.T) error {
+	t.Helper()
+	if len(p.done) != 1 {
+		t.Fatalf("OnDone called %d times, want 1", len(p.done))
+	}
+	return (<-p.done).err
 }
 
 type fakePool struct {
@@ -156,7 +178,7 @@ func TestDownloadAllSucceed(t *testing.T) {
 	defer cancel()
 
 	elems := []Elem{&fakeElem{dc: 2}, &fakeElem{dc: 3}}
-	progress := make(fakeProgress, len(elems))
+	progress := newFakeProgress(t, len(elems))
 	d := New(Options{
 		Pool:    fakePool{clients: map[int]tg.Invoker{2: successInvoker{}, 3: successInvoker{}}},
 		Threads: 1, Iter: &fakeIter{elems: elems}, Progress: progress,
@@ -164,11 +186,11 @@ func TestDownloadAllSucceed(t *testing.T) {
 	if err := d.Download(ctx, 2); err != nil {
 		t.Fatalf("Download returned %v, want nil", err)
 	}
-	if len(progress) != len(elems) {
-		t.Fatalf("OnDone called %d times, want %d", len(progress), len(elems))
+	if len(progress.done) != len(elems) {
+		t.Fatalf("OnDone called %d times, want %d", len(progress.done), len(elems))
 	}
 	for range elems {
-		done := <-progress
+		done := <-progress.done
 		if done.err != nil || done.elem.(*fakeElem).data[0] != 'x' {
 			t.Errorf("DC %d did not write the downloaded byte, OnDone error = %v", done.elem.File().DC(), done.err)
 		}
@@ -180,7 +202,7 @@ func TestDownloadReportsTwoFailedTransfers(t *testing.T) {
 	defer cancel()
 
 	elems := []Elem{&fakeElem{dc: 2}, &fakeElem{dc: 3}}
-	progress := make(fakeProgress, len(elems))
+	progress := newFakeProgress(t, len(elems))
 	d := New(Options{
 		Pool:    fakePool{clients: map[int]tg.Invoker{2: errInvoker{}, 3: errInvoker{}}},
 		Threads: 1, Iter: &fakeIter{elems: elems}, Progress: progress,
@@ -188,11 +210,11 @@ func TestDownloadReportsTwoFailedTransfers(t *testing.T) {
 	if err := d.Download(ctx, 2); err == nil || err.Error() != "2 file(s) failed to download" {
 		t.Errorf("Download returned %v, want 2 file(s) failed to download", err)
 	}
-	if len(progress) != len(elems) {
-		t.Fatalf("OnDone called %d times, want %d", len(progress), len(elems))
+	if len(progress.done) != len(elems) {
+		t.Fatalf("OnDone called %d times, want %d", len(progress.done), len(elems))
 	}
 	for range elems {
-		if done := <-progress; !tgerr.Is(done.err, "CONNECTION_LAYER_INVALID") {
+		if done := <-progress.done; !tgerr.Is(done.err, "CONNECTION_LAYER_INVALID") {
 			t.Errorf("OnDone received %v, want CONNECTION_LAYER_INVALID", done.err)
 		}
 	}
@@ -207,7 +229,7 @@ func TestDownloadRoutesTakeoutToDC(t *testing.T) {
 		calls.Add(1)
 		return successInvoker{}.Invoke(ctx, input, output)
 	})
-	progress := make(fakeProgress, 1)
+	progress := newFakeProgress(t, 1)
 	d := New(Options{
 		Pool:    fakePool{clients: map[int]tg.Invoker{4: errInvoker{}}, takeouts: map[int]tg.Invoker{4: inv}},
 		Threads: 1, Iter: &fakeIter{elems: []Elem{&fakeElem{dc: 4, takeout: true}}}, Progress: progress,
@@ -229,7 +251,7 @@ func TestDownloadReportsFailedTransfer(t *testing.T) {
 
 	pool := fakePool{clients: map[int]tg.Invoker{2: errInvoker{}}}
 	iter := &fakeIter{elems: []Elem{&fakeElem{dc: 2}}}
-	progress := make(fakeProgress, 2)
+	progress := newFakeProgress(t, 1)
 	d := New(Options{Pool: pool, Threads: 1, Iter: iter, Progress: progress})
 
 	if err := d.Download(ctx, 1); err == nil || err.Error() != "1 file(s) failed to download" {
@@ -244,7 +266,7 @@ func TestDownloadDeadConnectionIsAFailure(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
 	defer cancel()
 
-	failed, sibling := &fakeElem{dc: 2}, &fakeElem{dc: 3}
+	failed, sibling, third := &fakeElem{dc: 2}, &fakeElem{dc: 3}, &fakeElem{dc: 4}
 	entered, release := make(chan struct{}), make(chan struct{})
 	var enteredOnce sync.Once
 	pool := fakePool{clients: map[int]tg.Invoker{
@@ -272,14 +294,15 @@ func TestDownloadDeadConnectionIsAFailure(t *testing.T) {
 				return ctx.Err()
 			}
 		}),
+		4: successInvoker{},
 	}}
-	progress := make(fakeProgress, 3)
-	d := New(Options{Pool: pool, Threads: 1, Iter: &fakeIter{elems: []Elem{failed, sibling}}, Progress: progress})
+	progress := newFakeProgress(t, 3)
+	d := New(Options{Pool: pool, Threads: 1, Iter: &fakeIter{elems: []Elem{failed, sibling, third}}, Progress: progress})
 	result := make(chan error, 1)
 	go func() { result <- d.Download(ctx, 2) }()
 
 	select {
-	case done := <-progress:
+	case done := <-progress.done:
 		if done.elem != failed || done.err == nil || errors.Is(done.err, context.Canceled) ||
 			!strings.Contains(done.err.Error(), "connection lost") {
 			t.Errorf("first OnDone was for DC %d with %v, want connection loss for DC 2", done.elem.File().DC(), done.err)
@@ -296,11 +319,19 @@ func TestDownloadDeadConnectionIsAFailure(t *testing.T) {
 	case <-ctx.Done():
 		t.Fatal("Download did not return after releasing sibling")
 	}
-	if len(progress) != 1 {
-		t.Fatalf("OnDone called %d more times, want 1", len(progress))
+	if len(progress.done) != 2 {
+		t.Fatalf("OnDone called %d more times, want 2", len(progress.done))
 	}
-	if done := <-progress; done.elem != sibling || done.err != nil {
-		t.Errorf("second OnDone was for DC %d with %v, want success for DC 3", done.elem.File().DC(), done.err)
+	want := map[Elem]bool{sibling: true, third: true}
+	for range 2 {
+		done := <-progress.done
+		if !want[done.elem] || done.err != nil {
+			t.Errorf("unexpected OnDone for DC %d with %v", done.elem.File().DC(), done.err)
+		}
+		want[done.elem] = false
+	}
+	if third.data[0] != 'x' {
+		t.Error("third element did not write the downloaded byte")
 	}
 }
 
@@ -309,7 +340,7 @@ func TestDownloadUserCancel(t *testing.T) {
 	defer cancel()
 
 	inv := &releaseInvoker{entered: make(chan struct{})}
-	progress := make(fakeProgress, 2)
+	progress := newFakeProgress(t, 1)
 	d := New(Options{
 		Pool: fakePool{clients: map[int]tg.Invoker{2: inv}}, Threads: 1,
 		Iter: &fakeIter{elems: []Elem{&fakeElem{dc: 2}}}, Progress: progress,
@@ -340,6 +371,75 @@ func TestDownloadUserCancel(t *testing.T) {
 	}
 }
 
+func TestDownloadUserCancelStopsSiblingsAndWins(t *testing.T) {
+	for _, test := range []struct {
+		name         string
+		recordCancel bool
+	}{
+		{name: "worker cancellation"},
+		{name: "iterator records cancellation", recordCancel: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+
+			failed, first, second := &fakeElem{dc: 2}, &fakeElem{dc: 3}, &fakeElem{dc: 4}
+			a := &releaseInvoker{entered: make(chan struct{})}
+			b := &releaseInvoker{entered: make(chan struct{})}
+			pool := fakePool{clients: map[int]tg.Invoker{2: errInvoker{}, 3: a, 4: b}}
+			iter := &fakeIter{elems: []Elem{failed, first, second}, recordCancel: test.recordCancel}
+			if test.recordCancel {
+				iter.waitBeforeEnd = make(chan struct{})
+			}
+			progress := newFakeProgress(t, 3)
+			d := New(Options{Pool: pool, Threads: 1, Iter: iter, Progress: progress})
+			result := make(chan error, 1)
+			go func() { result <- d.Download(ctx, 3) }()
+
+			deadline := time.After(2 * time.Second)
+			for _, entered := range []<-chan struct{}{a.entered, b.entered} {
+				select {
+				case <-entered:
+				case <-deadline:
+					t.Fatal("sibling never entered its RPC")
+				}
+			}
+			select {
+			case done := <-progress.done:
+				if done.elem != failed || !tgerr.Is(done.err, "CONNECTION_LAYER_INVALID") {
+					t.Fatalf("first OnDone was for DC %d with %v, want CONNECTION_LAYER_INVALID for DC 2", done.elem.File().DC(), done.err)
+				}
+			case <-deadline:
+				t.Fatal("failed transfer did not report completion")
+			}
+			cancel()
+
+			select {
+			case err := <-result:
+				if !errors.Is(err, context.Canceled) || strings.Contains(err.Error(), "failed to download") {
+					t.Errorf("Download returned %v, want cancellation without a failure count", err)
+				}
+			case <-deadline:
+				t.Fatal("Download did not return after cancel")
+			}
+			if test.recordCancel && !errors.Is(iter.Err(), context.Canceled) {
+				t.Errorf("iterator returned %v, want context.Canceled", iter.Err())
+			}
+			if len(progress.done) != 2 {
+				t.Fatalf("OnDone called %d more times, want 2", len(progress.done))
+			}
+			want := map[Elem]bool{first: true, second: true}
+			for range 2 {
+				done := <-progress.done
+				if !want[done.elem] || !errors.Is(done.err, context.Canceled) || strings.Contains(done.err.Error(), "connection lost") {
+					t.Errorf("unexpected OnDone for DC %d with %v", done.elem.File().DC(), done.err)
+				}
+				want[done.elem] = false
+			}
+		})
+	}
+}
+
 func TestDownloadIterErrorWaitsForWorkers(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
@@ -348,7 +448,7 @@ func TestDownloadIterErrorWaitsForWorkers(t *testing.T) {
 	inv := &releaseInvoker{entered: make(chan struct{}), release: release}
 	pool := fakePool{clients: map[int]tg.Invoker{2: inv}}
 	iter := &fakeIter{elems: []Elem{&fakeElem{dc: 2}}, waitBeforeEnd: inv.entered, err: errIter}
-	progress := make(fakeProgress, 2)
+	progress := newFakeProgress(t, 1)
 	d := New(Options{Pool: pool, Threads: 1, Iter: iter, Progress: progress})
 	result := make(chan error, 1)
 	go func() { result <- d.Download(ctx, 1) }()

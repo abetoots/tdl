@@ -89,12 +89,8 @@ func Run(ctx context.Context, c *telegram.Client, kvd storage.Storage, opts Opti
 		color.Yellow("Restart download by 'restart' flag")
 	}
 
-	defer func() { // save progress
-		if rerr != nil { // download is interrupted
-			multierr.AppendInto(&rerr, saveProgress(ctx, kvd, it))
-		} else { // if finished, we should clear resume key
-			multierr.AppendInto(&rerr, kvd.Delete(ctx, key.Resume(it.Fingerprint())))
-		}
+	defer func() {
+		multierr.AppendInto(&rerr, finishResume(ctx, kvd, it, rerr))
 	}()
 
 	dlProgress := prog.New(utils.Byte.FormatBinaryBytes)
@@ -140,10 +136,22 @@ func Run(ctx context.Context, c *telegram.Client, kvd storage.Storage, opts Opti
 		}
 	}()
 
-	if err := downloader.New(options).Download(ctx, limit); err != nil {
+	return runDownload(ctx, downloader.New(options), progress, limit)
+}
+
+func runDownload(ctx context.Context, d *downloader.Downloader, p *progress, limit int) error {
+	err := d.Download(ctx, limit)
+	if errors.Is(err, context.Canceled) {
 		return err
 	}
-	return progress.err()
+	return multierr.Combine(err, p.err())
+}
+
+func finishResume(ctx context.Context, kvd storage.Storage, it *iter, rerr error) error {
+	if rerr != nil {
+		return saveProgress(ctx, kvd, it)
+	}
+	return kvd.Delete(ctx, key.Resume(it.Fingerprint()))
 }
 
 func collectDialogs(parsers []parser) ([][]*tmessage.Dialog, error) {

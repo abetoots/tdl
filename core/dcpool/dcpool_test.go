@@ -7,6 +7,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/gotd/td/bin"
@@ -126,40 +127,81 @@ func closeWithin(t *testing.T, p *pool, timeout time.Duration) error {
 	}
 }
 
-func TestTakeoutInitFailureFallsBack(t *testing.T) {
-	api := &fakeAPI{initErr: errTakeoutInit}
-	p := newPool(api, 1)
-	c := takeoutWithin(t, p, 2, 2*time.Second)
-	if _, err := c.HelpGetConfig(t.Context()); !errors.Is(err, errStub) {
-		t.Fatalf("HelpGetConfig error = %v, want %v", err, errStub)
-	}
-	if len(api.invoker.inputs) != 1 {
-		t.Fatalf("recorded %d requests, want 1", len(api.invoker.inputs))
-	}
-	if _, ok := api.invoker.inputs[0].(*tg.HelpGetConfigRequest); !ok {
-		t.Errorf("request = %T, want *tg.HelpGetConfigRequest", api.invoker.inputs[0])
+func TestTakeoutInitErrors(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		initErr   error
+		wantCalls int32
+	}{
+		{name: "network", initErr: errStub, wantCalls: 2},
+		{name: "canceled", initErr: context.Canceled, wantCalls: 2},
+		{name: "timed out", initErr: context.DeadlineExceeded, wantCalls: 2},
+		{name: "wrapped RPC", initErr: fmt.Errorf("rpcDoRequest: %w", errTakeoutInit), wantCalls: 1},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			api := &fakeAPI{initErr: test.initErr}
+			p := newPool(api, 1)
+			ctx := t.Context()
+			first := takeoutWithin(t, p, 2, 2*time.Second)
+			if _, err := first.HelpGetConfig(ctx); !errors.Is(err, errStub) {
+				t.Fatalf("first HelpGetConfig error = %v, want %v", err, errStub)
+			}
+			api.initErr = nil
+			second := takeoutWithin(t, p, 2, 2*time.Second)
+			if _, err := second.HelpGetConfig(ctx); !errors.Is(err, errStub) {
+				t.Fatalf("second HelpGetConfig error = %v, want %v", err, errStub)
+			}
+			if calls := api.initCalls.Load(); calls != test.wantCalls {
+				t.Errorf("takeout init calls = %d, want %d", calls, test.wantCalls)
+			}
+			if len(api.invoker.inputs) != 2 {
+				t.Fatalf("recorded %d requests on DC 2, want 2", len(api.invoker.inputs))
+			}
+			if input := api.invoker.inputs[0]; !isPlainConfigRequest(input) {
+				t.Errorf("first request = %T, want *tg.HelpGetConfigRequest", input)
+			}
+			secondInput := api.invoker.inputs[1]
+			if test.wantCalls == 1 {
+				if !isPlainConfigRequest(secondInput) {
+					t.Errorf("second request = %T, want *tg.HelpGetConfigRequest", secondInput)
+				}
+			} else if req, ok := secondInput.(*tg.InvokeWithTakeoutRequest); !ok || req.TakeoutID != 42 {
+				t.Errorf("second request = %v, want takeout request with ID 42", secondInput)
+			}
+		})
 	}
 }
 
-func TestTakeoutInitFailureIsNotRetried(t *testing.T) {
-	api := &fakeAPI{initErr: errTakeoutInit}
-	p := newPool(api, 1)
-	takeoutWithin(t, p, 2, 2*time.Second)
-	takeoutWithin(t, p, 2, 2*time.Second)
-	if calls := api.initCalls.Load(); calls != 1 {
-		t.Errorf("takeout init calls = %d, want 1", calls)
-	}
+func isPlainConfigRequest(input bin.Encoder) bool {
+	_, ok := input.(*tg.HelpGetConfigRequest)
+	return ok
 }
 
-func TestTakeoutRetriesAfterNonRPCError(t *testing.T) {
-	api := &fakeAPI{initErr: errStub}
-	p := newPool(api, 1)
-	takeoutWithin(t, p, 2, 2*time.Second)
-	api.initErr = nil
-	takeoutWithin(t, p, 2, 2*time.Second)
-	if calls := api.initCalls.Load(); calls != 2 {
-		t.Errorf("takeout init calls = %d, want 2", calls)
-	}
+func TestTakeoutInitTimeout(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		api := &fakeAPI{gate: make(chan struct{})}
+		p := newPool(api, 1)
+		ctx, cancel := context.WithTimeout(t.Context(), 31*time.Second)
+		defer cancel()
+
+		start := time.Now()
+		client := p.Takeout(ctx, 2)
+		if elapsed := time.Since(start); elapsed != 30*time.Second {
+			t.Errorf("takeout init took %v, want 30s", elapsed)
+		}
+		if err := ctx.Err(); err != nil {
+			t.Errorf("parent context error = %v, want nil", err)
+		}
+		if _, err := client.HelpGetConfig(t.Context()); !errors.Is(err, errStub) {
+			t.Fatalf("HelpGetConfig error = %v, want %v", err, errStub)
+		}
+		if len(api.invoker.inputs) != 1 || !isPlainConfigRequest(api.invoker.inputs[0]) {
+			t.Errorf("requests after timeout = %v, want one plain config request", api.invoker.inputs)
+		}
+		if p.takeoutFailed || p.takeout != 0 {
+			t.Error("timeout changed the takeout state from never tried")
+		}
+	})
 }
 
 func TestTakeoutRoutesRequestsToDC(t *testing.T) {
@@ -294,8 +336,10 @@ func TestClientAndDefaultStayPlain(t *testing.T) {
 	}
 }
 
-// the race check requires -race.
 func TestCloseDoesNotRaceClient(t *testing.T) {
+	if !raceEnabled {
+		t.Skip("needs -race")
+	}
 	p := newPool(&fakeAPI{}, 1)
 	ctx := t.Context()
 	p.Client(ctx, 2)
@@ -315,8 +359,10 @@ func TestCloseDoesNotRaceClient(t *testing.T) {
 	}
 }
 
-// the race check requires -race.
 func TestCloseDoesNotRaceTakeout(t *testing.T) {
+	if !raceEnabled {
+		t.Skip("needs -race")
+	}
 	p := newPool(&fakeAPI{}, 1)
 	ctx := t.Context()
 	start, done := make(chan struct{}), make(chan struct{})
@@ -333,6 +379,45 @@ func TestCloseDoesNotRaceTakeout(t *testing.T) {
 	case <-done:
 	case <-time.After(2 * time.Second):
 		t.Fatal("Takeout deadlocked")
+	}
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.takeout != 0 || len(p.closes) != 0 {
+		t.Errorf("pool after Close and Takeout has takeout ID %d and %d closers, want zero", p.takeout, len(p.closes))
+	}
+}
+
+func TestClientsAfterClose(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		client func(*pool, context.Context) *tg.Client
+	}{
+		{name: "Takeout", client: func(p *pool, ctx context.Context) *tg.Client { return p.Takeout(ctx, 4) }},
+		{name: "Client", client: func(p *pool, ctx context.Context) *tg.Client { return p.Client(ctx, 4) }},
+		{name: "Default", client: (*pool).Default},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			api := &fakeAPI{}
+			p := newPool(api, 1)
+			ctx := t.Context()
+			p.Default(ctx)
+			if err := closeWithin(t, p, 2*time.Second); err != nil {
+				t.Fatalf("Close error = %v, want nil", err)
+			}
+			before := api.initCalls.Load()
+
+			_, err := test.client(p, ctx).HelpGetConfig(ctx)
+			if !errors.Is(err, errPoolClosed) {
+				t.Errorf("HelpGetConfig error = %v, want %v", err, errPoolClosed)
+			}
+			if calls := api.initCalls.Load(); calls != before {
+				t.Errorf("takeout init calls changed from %d to %d", before, calls)
+			}
+			if len(api.dcs) != 0 {
+				t.Errorf("created %d new DC invokers, want 0", len(api.dcs))
+			}
+		})
 	}
 }
 
