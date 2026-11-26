@@ -103,11 +103,12 @@ func Run(ctx context.Context, c *telegram.Client, kvd storage.Storage, opts Opti
 		prog.EnablePS(ctx, dlProgress)
 	}
 
+	progress := newProgress(dlProgress, it, opts)
 	options := downloader.Options{
 		Pool:     pool,
 		Threads:  viper.GetInt(consts.FlagThreads),
 		Iter:     it,
-		Progress: newProgress(dlProgress, it, opts),
+		Progress: progress,
 	}
 	limit := viper.GetInt(consts.FlagLimit)
 
@@ -139,7 +140,10 @@ func Run(ctx context.Context, c *telegram.Client, kvd storage.Storage, opts Opti
 		}
 	}()
 
-	return downloader.New(options).Download(ctx, limit)
+	if err := downloader.New(options).Download(ctx, limit); err != nil {
+		return err
+	}
+	return progress.err()
 }
 
 func collectDialogs(parsers []parser) ([][]*tmessage.Dialog, error) {

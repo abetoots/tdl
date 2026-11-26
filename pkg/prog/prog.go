@@ -42,13 +42,15 @@ func New(formatter progress.UnitsFormatter) progress.Writer {
 }
 
 func Wait(ctx context.Context, pw progress.Writer) {
+	stopped := false
 	for pw.IsRenderInProgress() {
 		select {
 		case <-ctx.Done():
 			return
 		default:
-			if pw.LengthActive() == 0 {
+			if !stopped && pw.LengthActive() == 0 {
 				pw.Stop()
+				stopped = true
 			}
 			time.Sleep(10 * time.Millisecond)
 		}

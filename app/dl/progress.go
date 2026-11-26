@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/fatih/color"
@@ -20,12 +21,15 @@ import (
 	"github.com/iyear/tdl/pkg/utils"
 )
 
-type progress struct {
-	pw       pw.Writer
-	trackers *sync.Map // map[ID]*pw.Tracker
-	opts     Options
+var chtimes = os.Chtimes
 
-	it *iter
+type progress struct {
+	pw         pw.Writer
+	trackers   *sync.Map // map[ID]*pw.Tracker
+	downloaded sync.Map  // map[ID]int64
+	opts       Options
+	it         *iter
+	failed     atomic.Int64
 }
 
 func newProgress(p pw.Writer, it *iter, opts Options) *progress {
@@ -43,11 +47,13 @@ func (p *progress) OnAdd(elem downloader.Elem) {
 }
 
 func (p *progress) OnDownload(elem downloader.Elem, state downloader.ProgressState) {
-	tracker, ok := p.trackers.Load(elem.(*iterElem).id)
+	id := elem.(*iterElem).id
+	tracker, ok := p.trackers.Load(id)
 	if !ok {
 		return
 	}
 
+	p.downloaded.Store(id, state.Downloaded)
 	t := tracker.(*pw.Tracker)
 	t.UpdateTotal(state.Total)
 	value := state.Downloaded
@@ -65,20 +71,28 @@ func (p *progress) OnDone(elem downloader.Elem, err error) {
 		return
 	}
 	t := tracker.(*pw.Tracker)
+	downloaded, _ := p.downloaded.LoadAndDelete(e.id)
 
-	if closeErr := e.to.Close(); closeErr != nil {
+	canceled := errors.Is(err, context.Canceled)
+	closeErr := e.to.Close()
+	if closeErr != nil {
 		closeErr = errors.Wrap(closeErr, "close file")
-		if err == nil {
+		switch {
+		case err == nil:
+			p.failed.Add(1)
 			err = closeErr
-		} else {
+		case !canceled:
 			err = errors.Join(err, closeErr)
 		}
 	}
 
 	if err != nil {
-		if errors.Is(err, context.Canceled) {
+		switch {
+		case canceled && closeErr == nil:
 			t.MarkAsErrored()
-		} else {
+		case canceled:
+			p.fail(t, elem, closeErr)
+		default:
 			p.fail(t, elem, errors.Wrap(err, "progress"))
 		}
 		_ = os.Remove(e.to.Name()) // just try to remove temp file, ignore error
@@ -86,14 +100,25 @@ func (p *progress) OnDone(elem downloader.Elem, err error) {
 	}
 
 	if err := p.donePost(e); err != nil {
+		p.failed.Add(1)
 		p.fail(t, elem, errors.Wrap(err, "post file"))
 		return
 	}
 
 	p.it.Finish(e.logicalPos)
+	if count, ok := downloaded.(int64); ok && count > 0 {
+		t.SetValue(count)
+	}
 	if !t.IsDone() {
 		t.MarkAsDone()
 	}
+}
+
+func (p *progress) err() error {
+	if n := p.failed.Load(); n > 0 {
+		return errors.Errorf("%d file(s) failed after download", n)
+	}
+	return nil
 }
 
 func (p *progress) donePost(elem *iterElem) error {
@@ -118,7 +143,7 @@ func (p *progress) donePost(elem *iterElem) error {
 	// keep the renamed file complete even if its timestamp cannot be set
 	if elem.file.Date > 0 {
 		fileTime := time.Unix(elem.file.Date, 0)
-		if err := os.Chtimes(newpath, fileTime, fileTime); err != nil {
+		if err := chtimes(newpath, fileTime, fileTime); err != nil {
 			p.pw.Log(color.YellowString("%s: set file time: %s", p.elemString(elem), err))
 		}
 	}

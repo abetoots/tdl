@@ -17,11 +17,13 @@ import (
 
 var (
 	errStub        = errors.New("stub error")
+	errClosed      = errors.New("invoker closed")
 	errTakeoutInit = tgerr.New(420, "TAKEOUT_INIT_DELAY_3600")
 )
 
 type fakeAPI struct {
 	invoker   fakeInvoker
+	dcs       map[int]*fakeInvoker
 	initErr   error
 	initCalls atomic.Int32
 	entered   chan struct{}
@@ -36,8 +38,14 @@ func (a *fakeAPI) Pool(_ int64) (telegram.CloseInvoker, error) {
 	return &a.invoker, nil
 }
 
-func (a *fakeAPI) DC(context.Context, int, int64) (telegram.CloseInvoker, error) {
-	return &fakeInvoker{}, nil
+func (a *fakeAPI) DC(_ context.Context, dc int, _ int64) (telegram.CloseInvoker, error) {
+	if a.dcs == nil {
+		a.dcs = make(map[int]*fakeInvoker)
+	}
+	if a.dcs[dc] == nil {
+		a.dcs[dc] = &fakeInvoker{}
+	}
+	return a.dcs[dc], nil
 }
 
 func (a *fakeAPI) Invoke(ctx context.Context, input bin.Encoder, output bin.Decoder) error {
@@ -68,12 +76,17 @@ type fakeInvoker struct {
 	mu         sync.Mutex
 	inputs     []bin.Encoder
 	closeCalls int
+	deadline   time.Time
 }
 
-func (i *fakeInvoker) Invoke(_ context.Context, input bin.Encoder, _ bin.Decoder) error {
+func (i *fakeInvoker) Invoke(ctx context.Context, input bin.Encoder, _ bin.Decoder) error {
 	i.mu.Lock()
 	defer i.mu.Unlock()
 	i.inputs = append(i.inputs, input)
+	if i.closeCalls != 0 {
+		return errClosed
+	}
+	i.deadline, _ = ctx.Deadline()
 	return errStub
 }
 
@@ -84,12 +97,12 @@ func (i *fakeInvoker) Close() error {
 	return nil
 }
 
-func takeoutWithin(t *testing.T, p *pool, timeout time.Duration) *tg.Client {
+func takeoutWithin(t *testing.T, p *pool, dc int, timeout time.Duration) *tg.Client {
 	t.Helper()
 	ctx := t.Context()
 	result := make(chan *tg.Client, 1)
 	go func() {
-		result <- p.Takeout(ctx, 2)
+		result <- p.Takeout(ctx, dc)
 	}()
 	select {
 	case c := <-result:
@@ -100,10 +113,23 @@ func takeoutWithin(t *testing.T, p *pool, timeout time.Duration) *tg.Client {
 	}
 }
 
+func closeWithin(t *testing.T, p *pool, timeout time.Duration) error {
+	t.Helper()
+	result := make(chan error, 1)
+	go func() { result <- p.Close() }()
+	select {
+	case err := <-result:
+		return err
+	case <-time.After(timeout):
+		t.Fatal("Close deadlocked")
+		return nil
+	}
+}
+
 func TestTakeoutInitFailureFallsBack(t *testing.T) {
 	api := &fakeAPI{initErr: errTakeoutInit}
 	p := newPool(api, 1)
-	c := takeoutWithin(t, p, 2*time.Second)
+	c := takeoutWithin(t, p, 2, 2*time.Second)
 	if _, err := c.HelpGetConfig(t.Context()); !errors.Is(err, errStub) {
 		t.Fatalf("HelpGetConfig error = %v, want %v", err, errStub)
 	}
@@ -118,10 +144,52 @@ func TestTakeoutInitFailureFallsBack(t *testing.T) {
 func TestTakeoutInitFailureIsNotRetried(t *testing.T) {
 	api := &fakeAPI{initErr: errTakeoutInit}
 	p := newPool(api, 1)
-	takeoutWithin(t, p, 2*time.Second)
-	takeoutWithin(t, p, 2*time.Second)
+	takeoutWithin(t, p, 2, 2*time.Second)
+	takeoutWithin(t, p, 2, 2*time.Second)
 	if calls := api.initCalls.Load(); calls != 1 {
 		t.Errorf("takeout init calls = %d, want 1", calls)
+	}
+}
+
+func TestTakeoutRetriesAfterNonRPCError(t *testing.T) {
+	api := &fakeAPI{initErr: errStub}
+	p := newPool(api, 1)
+	takeoutWithin(t, p, 2, 2*time.Second)
+	api.initErr = nil
+	takeoutWithin(t, p, 2, 2*time.Second)
+	if calls := api.initCalls.Load(); calls != 2 {
+		t.Errorf("takeout init calls = %d, want 2", calls)
+	}
+}
+
+func TestTakeoutRoutesRequestsToDC(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		initErr error
+	}{
+		{name: "init fails", initErr: errTakeoutInit},
+		{name: "init succeeds"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			api := &fakeAPI{initErr: test.initErr}
+			p := newPool(api, 1)
+			client := takeoutWithin(t, p, 4, 2*time.Second)
+			if _, err := client.HelpGetConfig(t.Context()); !errors.Is(err, errStub) {
+				t.Fatalf("HelpGetConfig error = %v, want %v", err, errStub)
+			}
+			inv := api.dcs[4]
+			if inv == nil || len(inv.inputs) != 1 || len(api.invoker.inputs) != 0 {
+				t.Fatalf("expected one request on DC 4 and none on the default DC")
+			}
+			input := inv.inputs[0]
+			if test.initErr != nil {
+				if _, ok := input.(*tg.HelpGetConfigRequest); !ok {
+					t.Errorf("request = %T, want *tg.HelpGetConfigRequest", input)
+				}
+			} else if req, ok := input.(*tg.InvokeWithTakeoutRequest); !ok || req.TakeoutID != 42 {
+				t.Errorf("request = %v, want takeout request with ID 42", input)
+			}
+		})
 	}
 }
 
@@ -202,7 +270,7 @@ func TestClientAndDefaultStayPlain(t *testing.T) {
 			p := newPool(api, 1)
 			ctx := t.Context()
 			if tt.init {
-				takeoutWithin(t, p, 2*time.Second)
+				takeoutWithin(t, p, 2, 2*time.Second)
 			}
 			_, _ = p.Client(ctx, 2).HelpGetConfig(ctx)
 			_, _ = p.Default(ctx).HelpGetConfig(ctx)
@@ -215,7 +283,7 @@ func TestClientAndDefaultStayPlain(t *testing.T) {
 				}
 			}
 			if !tt.init || tt.initErr != nil {
-				if err := p.Close(); err != nil {
+				if err := closeWithin(t, p, 2*time.Second); err != nil {
 					t.Errorf("Close error = %v, want nil", err)
 				}
 				if len(api.invoker.inputs) != 2 {
@@ -226,6 +294,7 @@ func TestClientAndDefaultStayPlain(t *testing.T) {
 	}
 }
 
+// the race check requires -race.
 func TestCloseDoesNotRaceClient(t *testing.T) {
 	p := newPool(&fakeAPI{}, 1)
 	ctx := t.Context()
@@ -239,10 +308,31 @@ func TestCloseDoesNotRaceClient(t *testing.T) {
 		})
 	}
 	close(start)
-	err := p.Close()
+	err := closeWithin(t, p, 2*time.Second)
 	wg.Wait()
 	if err != nil {
 		t.Errorf("Close error = %v, want nil", err)
+	}
+}
+
+// the race check requires -race.
+func TestCloseDoesNotRaceTakeout(t *testing.T) {
+	p := newPool(&fakeAPI{}, 1)
+	ctx := t.Context()
+	start, done := make(chan struct{}), make(chan struct{})
+	go func() {
+		defer close(done)
+		<-start
+		p.Takeout(ctx, 4)
+	}()
+	close(start)
+	if err := closeWithin(t, p, 2*time.Second); err != nil && !errors.Is(err, errStub) {
+		t.Errorf("Close error = %v, want nil or %v", err, errStub)
+	}
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Takeout deadlocked")
 	}
 }
 
@@ -250,8 +340,8 @@ func TestCloseFinishesTakeoutOnlyWhenStarted(t *testing.T) {
 	t.Run("failed init", func(t *testing.T) {
 		api := &fakeAPI{initErr: errTakeoutInit}
 		p := newPool(api, 1)
-		takeoutWithin(t, p, 2*time.Second)
-		if err := p.Close(); err != nil {
+		takeoutWithin(t, p, 2, 2*time.Second)
+		if err := closeWithin(t, p, 2*time.Second); err != nil {
 			t.Errorf("Close error = %v, want nil", err)
 		}
 		for _, input := range api.invoker.inputs {
@@ -267,9 +357,16 @@ func TestCloseFinishesTakeoutOnlyWhenStarted(t *testing.T) {
 	t.Run("started", func(t *testing.T) {
 		api := &fakeAPI{}
 		p := newPool(api, 1)
-		takeoutWithin(t, p, 2*time.Second)
-		if err := p.Close(); !errors.Is(err, errStub) {
+		takeoutWithin(t, p, 2, 2*time.Second)
+		before := time.Now()
+		if err := closeWithin(t, p, 2*time.Second); errors.Is(err, errClosed) {
+			t.Error("Close sent the finish request after closing the invoker")
+		} else if !errors.Is(err, errStub) {
 			t.Errorf("Close error = %v, want %v", err, errStub)
+		}
+		deadline := api.invoker.deadline
+		if deadline.Before(before.Add(10*time.Second)) || deadline.After(time.Now().Add(10*time.Second)) {
+			t.Errorf("finish request deadline = %v, want 10 seconds after Close started", deadline)
 		}
 		if len(api.invoker.inputs) != 1 {
 			t.Fatalf("recorded %d requests, want 1", len(api.invoker.inputs))
@@ -293,4 +390,23 @@ func TestCloseFinishesTakeoutOnlyWhenStarted(t *testing.T) {
 			t.Errorf("invoker Close calls = %d, want 1", api.invoker.closeCalls)
 		}
 	})
+}
+
+func TestCloseIsIdempotent(t *testing.T) {
+	api := &fakeAPI{}
+	p := newPool(api, 1)
+	takeoutWithin(t, p, 4, 2*time.Second)
+	if err := closeWithin(t, p, 2*time.Second); !errors.Is(err, errStub) {
+		t.Fatalf("first Close error = %v, want %v", err, errStub)
+	}
+	if err := closeWithin(t, p, 2*time.Second); err != nil {
+		t.Errorf("second Close error = %v, want nil", err)
+	}
+	if len(api.invoker.inputs) != 1 {
+		t.Errorf("recorded %d finish requests, want 1", len(api.invoker.inputs))
+	}
+	if api.invoker.closeCalls != 1 || api.dcs[4].closeCalls != 1 {
+		t.Errorf("close calls = %d on the default DC and %d on DC 4, want 1 each",
+			api.invoker.closeCalls, api.dcs[4].closeCalls)
+	}
 }
