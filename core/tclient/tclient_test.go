@@ -60,7 +60,7 @@ func TestDefaultMiddlewaresFloodWait(t *testing.T) {
 		})
 		start := time.Now()
 
-		err := withDefaultMiddlewares(ctx, next).Invoke(ctx, nil, nil)
+		err := withDefaultMiddlewares(ctx, next).Invoke(ctx, &tg.UploadGetFileRequest{}, &tg.UploadFileBox{})
 		if _, ok := tgerr.AsFloodWait(err); ok {
 			t.Errorf("Invoke error = %v, still matches a flood wait", err)
 		}
@@ -72,6 +72,31 @@ func TestDefaultMiddlewaresFloodWait(t *testing.T) {
 		}
 		if elapsed := time.Since(start); elapsed != 50*time.Second {
 			t.Errorf("Invoke took %v, want 50s", elapsed)
+		}
+	})
+}
+
+func TestDefaultMiddlewaresWaitsForMessages(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx := t.Context()
+		calls := 0
+		next := telegram.InvokeFunc(func(context.Context, bin.Encoder, bin.Decoder) error {
+			calls++
+			if calls <= 12 {
+				return tgerr.New(420, floodWait5)
+			}
+			return nil
+		})
+		start := time.Now()
+
+		if err := withDefaultMiddlewares(ctx, next).Invoke(ctx, &tg.ChannelsGetMessagesRequest{}, &tg.MessagesMessagesBox{}); err != nil {
+			t.Errorf("Invoke error = %v, want nil", err)
+		}
+		if calls != 13 {
+			t.Errorf("Invoke made %d attempts, want 13", calls)
+		}
+		if elapsed := time.Since(start); elapsed != time.Minute {
+			t.Errorf("Invoke took %v, want 1m", elapsed)
 		}
 	})
 }
