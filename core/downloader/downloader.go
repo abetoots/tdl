@@ -2,6 +2,7 @@ package downloader
 
 import (
 	"context"
+	"sync/atomic"
 
 	"github.com/go-faster/errors"
 	"github.com/gotd/td/telegram/downloader"
@@ -36,6 +37,7 @@ func New(opts Options) *Downloader {
 func (d *Downloader) Download(ctx context.Context, limit int) error {
 	wg, wgctx := errgroup.WithContext(ctx)
 	wg.SetLimit(limit)
+	var failed atomic.Int64
 
 	for d.opts.Iter.Next(wgctx) {
 		elem := d.opts.Iter.Value()
@@ -43,22 +45,22 @@ func (d *Downloader) Download(ctx context.Context, limit int) error {
 		wg.Go(func() error {
 			d.opts.Progress.OnAdd(elem)
 			err := d.download(wgctx, elem)
-			defer d.opts.Progress.OnDone(elem, err)
-
-			if err != nil {
-				if errors.Is(err, context.Canceled) {
-					return err
-				}
-
-				// don't return error, just log it
-				logctx.
-					From(ctx).
-					Error("Download error",
-						zap.Any("element", elem),
-						zap.Error(err),
-					)
+			if errors.Is(err, context.Canceled) && ctx.Err() == nil {
+				err = errors.Errorf("connection lost: %v", err)
 			}
+			d.opts.Progress.OnDone(elem, err)
 
+			if err == nil {
+				return nil
+			}
+			if errors.Is(err, context.Canceled) {
+				return errors.Wrap(err, "download")
+			}
+			logctx.From(ctx).Error("Download error",
+				zap.Any("element", elem),
+				zap.Error(err),
+			)
+			failed.Add(1)
 			return nil
 		})
 	}
@@ -67,7 +69,13 @@ func (d *Downloader) Download(ctx context.Context, limit int) error {
 	if err := d.opts.Iter.Err(); err != nil {
 		return errors.Wrap(err, "iter")
 	}
-	return workerErr
+	if workerErr != nil {
+		return workerErr
+	}
+	if count := failed.Load(); count > 0 {
+		return errors.Errorf("%d file(s) failed to download", count)
+	}
+	return nil
 }
 
 func (d *Downloader) download(ctx context.Context, elem Elem) error {

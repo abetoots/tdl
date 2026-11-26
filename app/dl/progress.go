@@ -50,7 +50,11 @@ func (p *progress) OnDownload(elem downloader.Elem, state downloader.ProgressSta
 
 	t := tracker.(*pw.Tracker)
 	t.UpdateTotal(state.Total)
-	t.SetValue(state.Downloaded)
+	value := state.Downloaded
+	if state.Total > 0 {
+		value = min(value, state.Total-1)
+	}
+	t.SetValue(value)
 }
 
 func (p *progress) OnDone(elem downloader.Elem, err error) {
@@ -62,9 +66,13 @@ func (p *progress) OnDone(elem downloader.Elem, err error) {
 	}
 	t := tracker.(*pw.Tracker)
 
-	if err := e.to.Close(); err != nil {
-		p.fail(t, elem, errors.Wrap(err, "close file"))
-		return
+	if closeErr := e.to.Close(); closeErr != nil {
+		closeErr = errors.Wrap(closeErr, "close file")
+		if err == nil {
+			err = closeErr
+		} else {
+			err = errors.Join(err, closeErr)
+		}
 	}
 
 	if err != nil {
@@ -107,11 +115,11 @@ func (p *progress) donePost(elem *iterElem) error {
 		return errors.Wrap(err, "rename file")
 	}
 
-	// Set file modification time to message date if available
+	// keep the renamed file complete even if its timestamp cannot be set
 	if elem.file.Date > 0 {
 		fileTime := time.Unix(elem.file.Date, 0)
 		if err := os.Chtimes(newpath, fileTime, fileTime); err != nil {
-			return errors.Wrap(err, "set file time")
+			p.pw.Log(color.YellowString("%s: set file time: %s", p.elemString(elem), err))
 		}
 	}
 

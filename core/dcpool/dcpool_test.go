@@ -21,10 +21,11 @@ var (
 )
 
 type fakeAPI struct {
-	t         *testing.T
 	invoker   fakeInvoker
 	initErr   error
 	initCalls atomic.Int32
+	entered   chan struct{}
+	gate      <-chan struct{}
 }
 
 func (a *fakeAPI) Config() tg.Config {
@@ -35,16 +36,24 @@ func (a *fakeAPI) Pool(_ int64) (telegram.CloseInvoker, error) {
 	return &a.invoker, nil
 }
 
-func (a *fakeAPI) DC(_ context.Context, dc int, _ int64) (telegram.CloseInvoker, error) {
-	a.t.Errorf("unexpected DC call for dc %d", dc)
-	return nil, errStub
+func (a *fakeAPI) DC(context.Context, int, int64) (telegram.CloseInvoker, error) {
+	return &fakeInvoker{}, nil
 }
 
-func (a *fakeAPI) Invoke(_ context.Context, input bin.Encoder, output bin.Decoder) error {
+func (a *fakeAPI) Invoke(ctx context.Context, input bin.Encoder, output bin.Decoder) error {
 	if _, ok := input.(*tg.AccountInitTakeoutSessionRequest); !ok {
 		return fmt.Errorf("unexpected request %T", input)
 	}
-	a.initCalls.Add(1)
+	if a.initCalls.Add(1) == 1 && a.entered != nil {
+		close(a.entered)
+	}
+	if a.gate != nil {
+		select {
+		case <-a.gate:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
 	if a.initErr != nil {
 		return a.initErr
 	}
@@ -92,7 +101,7 @@ func takeoutWithin(t *testing.T, p *pool, timeout time.Duration) *tg.Client {
 }
 
 func TestTakeoutInitFailureFallsBack(t *testing.T) {
-	api := &fakeAPI{t: t, initErr: errTakeoutInit}
+	api := &fakeAPI{initErr: errTakeoutInit}
 	p := newPool(api, 1)
 	c := takeoutWithin(t, p, 2*time.Second)
 	if _, err := c.HelpGetConfig(t.Context()); !errors.Is(err, errStub) {
@@ -107,7 +116,7 @@ func TestTakeoutInitFailureFallsBack(t *testing.T) {
 }
 
 func TestTakeoutInitFailureIsNotRetried(t *testing.T) {
-	api := &fakeAPI{t: t, initErr: errTakeoutInit}
+	api := &fakeAPI{initErr: errTakeoutInit}
 	p := newPool(api, 1)
 	takeoutWithin(t, p, 2*time.Second)
 	takeoutWithin(t, p, 2*time.Second)
@@ -125,7 +134,8 @@ func TestTakeoutConcurrentCallers(t *testing.T) {
 		{name: "init succeeds"},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			api := &fakeAPI{t: t, initErr: tt.initErr}
+			entered, gate := make(chan struct{}), make(chan struct{})
+			api := &fakeAPI{initErr: tt.initErr, entered: entered, gate: gate}
 			p := newPool(api, 1)
 			ctx := t.Context()
 			var wg sync.WaitGroup
@@ -134,6 +144,14 @@ func TestTakeoutConcurrentCallers(t *testing.T) {
 					_, _ = p.Takeout(ctx, 2).HelpGetConfig(ctx)
 				})
 			}
+			select {
+			case <-entered:
+			case <-time.After(2 * time.Second):
+				t.Fatal("takeout init never started")
+			}
+			time.Sleep(20 * time.Millisecond)
+			close(gate)
+
 			done := make(chan struct{})
 			go func() {
 				wg.Wait()
@@ -169,9 +187,68 @@ func TestTakeoutConcurrentCallers(t *testing.T) {
 	}
 }
 
+func TestClientAndDefaultStayPlain(t *testing.T) {
+	for _, tt := range []struct {
+		name    string
+		init    bool
+		initErr error
+	}{
+		{name: "never tried"},
+		{name: "init failed", init: true, initErr: errTakeoutInit},
+		{name: "started", init: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			api := &fakeAPI{initErr: tt.initErr}
+			p := newPool(api, 1)
+			ctx := t.Context()
+			if tt.init {
+				takeoutWithin(t, p, 2*time.Second)
+			}
+			_, _ = p.Client(ctx, 2).HelpGetConfig(ctx)
+			_, _ = p.Default(ctx).HelpGetConfig(ctx)
+			if len(api.invoker.inputs) != 2 {
+				t.Fatalf("recorded %d requests, want 2", len(api.invoker.inputs))
+			}
+			for idx, input := range api.invoker.inputs {
+				if _, ok := input.(*tg.HelpGetConfigRequest); !ok {
+					t.Errorf("request %d = %T, want *tg.HelpGetConfigRequest", idx, input)
+				}
+			}
+			if !tt.init || tt.initErr != nil {
+				if err := p.Close(); err != nil {
+					t.Errorf("Close error = %v, want nil", err)
+				}
+				if len(api.invoker.inputs) != 2 {
+					t.Errorf("Close sent %d requests, want 0", len(api.invoker.inputs)-2)
+				}
+			}
+		})
+	}
+}
+
+func TestCloseDoesNotRaceClient(t *testing.T) {
+	p := newPool(&fakeAPI{}, 1)
+	ctx := t.Context()
+	p.Client(ctx, 2)
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for dc := 3; dc <= 10; dc++ {
+		wg.Go(func() {
+			<-start
+			p.Client(ctx, dc)
+		})
+	}
+	close(start)
+	err := p.Close()
+	wg.Wait()
+	if err != nil {
+		t.Errorf("Close error = %v, want nil", err)
+	}
+}
+
 func TestCloseFinishesTakeoutOnlyWhenStarted(t *testing.T) {
 	t.Run("failed init", func(t *testing.T) {
-		api := &fakeAPI{t: t, initErr: errTakeoutInit}
+		api := &fakeAPI{initErr: errTakeoutInit}
 		p := newPool(api, 1)
 		takeoutWithin(t, p, 2*time.Second)
 		if err := p.Close(); err != nil {
@@ -188,7 +265,7 @@ func TestCloseFinishesTakeoutOnlyWhenStarted(t *testing.T) {
 	})
 
 	t.Run("started", func(t *testing.T) {
-		api := &fakeAPI{t: t}
+		api := &fakeAPI{}
 		p := newPool(api, 1)
 		takeoutWithin(t, p, 2*time.Second)
 		if err := p.Close(); !errors.Is(err, errStub) {
