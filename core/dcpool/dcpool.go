@@ -9,7 +9,6 @@ import (
 	"github.com/gotd/td/bin"
 	"github.com/gotd/td/telegram"
 	"github.com/gotd/td/tg"
-	"github.com/gotd/td/tgerr"
 	"go.uber.org/multierr"
 	"go.uber.org/zap"
 
@@ -109,7 +108,9 @@ func (p *pool) invoker(ctx context.Context, dc int) tg.Invoker {
 	if dc == p.current() { // can't transfer dc to current dc
 		invoker, err = p.api.Pool(p.size)
 	} else {
-		invoker, err = p.api.DC(ctx, dc, p.size)
+		dcCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		invoker, err = p.api.DC(dcCtx, dc, p.size)
+		cancel()
 	}
 
 	if err != nil {
@@ -167,7 +168,7 @@ func (p *pool) Takeout(ctx context.Context, dc int) *tg.Client {
 		sid, err := takeout.Takeout(initCtx, p.api)
 		cancel()
 		if err != nil {
-			if _, ok := tgerr.As(err); ok {
+			if ctx.Err() == nil {
 				p.takeoutFailed = true
 			}
 			logctx.From(ctx).Warn("takeout error", zap.Error(err))

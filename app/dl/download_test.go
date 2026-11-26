@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/gotd/td/bin"
+	"github.com/gotd/td/telegram"
 	"github.com/gotd/td/tg"
 	pw "github.com/jedib0t/go-pretty/v6/progress"
 	"github.com/stretchr/testify/assert"
@@ -41,11 +42,14 @@ func (*singleDownload) Err() error { return nil }
 
 type downloadTestPool struct {
 	dcpool.Pool
-	failures map[int]error
+	invokers map[int]tg.Invoker
 }
 
 func (p downloadTestPool) Client(_ context.Context, dc int) *tg.Client {
-	return tg.NewClient(downloadTestInvoker{err: p.failures[dc]})
+	if invoker := p.invokers[dc]; invoker != nil {
+		return tg.NewClient(invoker)
+	}
+	return tg.NewClient(downloadTestInvoker{})
 }
 
 type downloadTestInvoker struct{ err error }
@@ -128,43 +132,117 @@ func (s resumeTestStorage) Delete(_ context.Context, key string) error {
 }
 
 func TestRunDownloadOutcomes(t *testing.T) {
-	ctx := t.Context()
-	kvd := resumeTestStorage{}
 	const fingerprint = "download-outcomes"
+	const collision = "collision.bin"
+	const postFailure = "1 file(s) failed after download"
 	resumeKey := key.Resume(fingerprint)
-	names := []string{"success.bin", "transfer.bin", "connection.bin", "collision.bin"}
+	for _, test := range []struct {
+		name       string
+		files      []string
+		invokers   map[int]tg.Invoker
+		iterErr    error
+		cancel     bool
+		wantErrors []string
+		wantLogs   []string
+		wantSaved  string
+	}{
+		{
+			name:  "mixed failures",
+			files: []string{"success.bin", "transfer.bin", "connection.bin", collision},
+			invokers: map[int]tg.Invoker{
+				3: downloadTestInvoker{err: io.ErrUnexpectedEOF},
+				4: downloadTestInvoker{err: fmt.Errorf("engine forcibly closed: %w", context.Canceled)},
+			},
+			wantErrors: []string{"2 file(s) failed to download", postFailure},
+			wantLogs:   []string{"transfer.bin", "connection.bin", collision},
+			wantSaved:  `{"0":{}}`,
+		},
+		{name: "success", files: []string{"first.bin", "second.bin"}},
+		{
+			name:       "post-transfer failure only",
+			files:      []string{collision},
+			wantErrors: []string{postFailure},
+			wantLogs:   []string{collision},
+			wantSaved:  `{}`,
+		},
+		{
+			name:      "user cancel",
+			files:     []string{"success.bin", collision, "blocked.bin"},
+			cancel:    true,
+			wantLogs:  []string{collision},
+			wantSaved: `{"0":{}}`,
+		},
+		{
+			name:       "iterator cancellation with live run",
+			files:      []string{collision},
+			iterErr:    fmt.Errorf("connection lost: %w", context.Canceled),
+			wantErrors: []string{"iter: connection lost: context canceled", postFailure},
+			wantLogs:   []string{collision},
+			wantSaved:  `{}`,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			ctx := t.Context()
+			kvd := resumeTestStorage{resumeKey: []byte(`{"9":{}}`)}
+			dir := t.TempDir()
+			it := &iter{
+				mu: &sync.Mutex{}, finished: map[int]struct{}{}, fingerprint: fingerprint,
+				elem: make(chan downloader.Elem, len(test.files)), err: test.iterErr,
+			}
+			for pos, name := range test.files {
+				elem := newProgressTestElem(t, dir, name)
+				elem.id, elem.logicalPos, elem.fromMsg.ID = pos+1, pos, pos+1
+				elem.file.InputFileLoc = &tg.InputDocumentFileLocation{}
+				elem.file.Size = int64(len(downloadTestContent))
+				elem.file.DC = pos + 2
+				it.elem <- elem
+				if name == collision {
+					require.NoError(t, os.Mkdir(filepath.Join(dir, name), 0o700))
+				}
+			}
+			pool := downloadTestPool{invokers: test.invokers}
+			if test.cancel {
+				var cancel context.CancelFunc
+				ctx, cancel = context.WithCancel(ctx)
+				defer cancel()
+				blocked := make(chan struct{})
+				pool.invokers = map[int]tg.Invoker{4: telegram.InvokeFunc(func(ctx context.Context, _ bin.Encoder, _ bin.Decoder) error {
+					close(blocked)
+					<-ctx.Done()
+					return ctx.Err()
+				})}
+				go func() {
+					select {
+					case <-blocked:
+						cancel()
+					case <-ctx.Done():
+					}
+				}()
+			}
+			w := &logWriter{Writer: pw.NewWriter()}
+			p := newProgress(w, it, Options{})
+			d := downloader.New(downloader.Options{Pool: pool, Threads: 1, Iter: it, Progress: p})
+			// one worker ensures the rename has finished before the blocked transfer starts
+			err := runDownload(ctx, d, p, 1)
 
-	for _, mixed := range []bool{true, false} {
-		dir := t.TempDir()
-		it := &iter{
-			mu: &sync.Mutex{}, finished: map[int]struct{}{}, fingerprint: fingerprint,
-			elem: make(chan downloader.Elem, len(names)),
-		}
-		for pos, name := range names {
-			elem := newProgressTestElem(t, dir, name)
-			elem.id, elem.logicalPos, elem.fromMsg.ID = pos+1, pos, pos+1
-			elem.file.InputFileLoc = &tg.InputDocumentFileLocation{}
-			elem.file.Size = int64(len(downloadTestContent))
-			elem.file.DC = pos + 2
-			it.elem <- elem
-		}
-		w := &logWriter{Writer: pw.NewWriter()}
-		p := newProgress(w, it, Options{})
-		pool := downloadTestPool{}
-		if mixed {
-			pool.failures = map[int]error{3: io.ErrUnexpectedEOF, 4: fmt.Errorf("engine forcibly closed: %w", context.Canceled)}
-			require.NoError(t, os.Mkdir(filepath.Join(dir, names[3]), 0o700))
-		}
-		d := downloader.New(downloader.Options{Pool: pool, Threads: 1, Iter: it, Progress: p})
-		err := runDownload(ctx, d, p, len(names))
-
-		if mixed {
-			assert.ErrorContains(t, err, "2 file(s) failed to download")
-			assert.ErrorContains(t, err, "1 file(s) failed after download")
-			assert.ErrorContains(t, p.err(), "1 file(s) failed after download")
-			assert.Equal(t, map[int]struct{}{0: {}}, it.Finished())
-			require.Len(t, w.lines, 3)
-			for _, name := range names[1:] {
+			switch {
+			case test.cancel:
+				require.ErrorIs(t, err, context.Canceled)
+				assert.NotContains(t, err.Error(), "failed after download")
+				assert.EqualError(t, p.err(), postFailure)
+			case len(test.wantErrors) == 0:
+				assert.NoError(t, err)
+				assert.NoError(t, p.err())
+				assert.Len(t, it.Finished(), len(test.files))
+			case len(test.wantErrors) == 1:
+				assert.EqualError(t, err, test.wantErrors[0])
+			default:
+				for _, want := range test.wantErrors {
+					assert.ErrorContains(t, err, want)
+				}
+			}
+			require.Len(t, w.lines, len(test.wantLogs))
+			for _, name := range test.wantLogs {
 				count := 0
 				for _, line := range w.lines {
 					if strings.Contains(line, name+" error: ") {
@@ -174,17 +252,13 @@ func TestRunDownloadOutcomes(t *testing.T) {
 				assert.Equal(t, 1, count, name)
 			}
 			require.NoError(t, finishResume(ctx, kvd, it, err))
-			saved, err := kvd.Get(ctx, resumeKey)
-			require.NoError(t, err)
-			assert.JSONEq(t, `{"0":{}}`, string(saved))
-		} else {
-			assert.NoError(t, err)
-			assert.NoError(t, p.err())
-			assert.Len(t, it.Finished(), len(names))
-			assert.Empty(t, w.lines)
-			require.NoError(t, finishResume(ctx, kvd, it, err))
-			_, err := kvd.Get(ctx, resumeKey)
-			assert.ErrorIs(t, err, storage.ErrNotFound)
-		}
+			saved, getErr := kvd.Get(ctx, resumeKey)
+			if test.wantSaved == "" {
+				assert.ErrorIs(t, getErr, storage.ErrNotFound)
+			} else {
+				require.NoError(t, getErr)
+				assert.JSONEq(t, test.wantSaved, string(saved))
+			}
+		})
 	}
 }

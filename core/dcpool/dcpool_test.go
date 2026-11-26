@@ -29,6 +29,7 @@ type fakeAPI struct {
 	initCalls atomic.Int32
 	entered   chan struct{}
 	gate      <-chan struct{}
+	blockDC   bool
 }
 
 func (a *fakeAPI) Config() tg.Config {
@@ -39,7 +40,11 @@ func (a *fakeAPI) Pool(_ int64) (telegram.CloseInvoker, error) {
 	return &a.invoker, nil
 }
 
-func (a *fakeAPI) DC(_ context.Context, dc int, _ int64) (telegram.CloseInvoker, error) {
+func (a *fakeAPI) DC(ctx context.Context, dc int, _ int64) (telegram.CloseInvoker, error) {
+	if a.blockDC {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
 	if a.dcs == nil {
 		a.dcs = make(map[int]*fakeInvoker)
 	}
@@ -55,6 +60,9 @@ func (a *fakeAPI) Invoke(ctx context.Context, input bin.Encoder, output bin.Deco
 	}
 	if a.initCalls.Add(1) == 1 && a.entered != nil {
 		close(a.entered)
+	}
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 	if a.gate != nil {
 		select {
@@ -129,22 +137,32 @@ func closeWithin(t *testing.T, p *pool, timeout time.Duration) error {
 
 func TestTakeoutInitErrors(t *testing.T) {
 	for _, test := range []struct {
-		name      string
-		initErr   error
-		wantCalls int32
+		name         string
+		initErr      error
+		cancelCaller bool
+		wantCalls    int32
 	}{
-		{name: "network", initErr: errStub, wantCalls: 2},
-		{name: "canceled", initErr: context.Canceled, wantCalls: 2},
-		{name: "timed out", initErr: context.DeadlineExceeded, wantCalls: 2},
+		{name: "network", initErr: errStub, wantCalls: 1},
+		{name: "connection canceled", initErr: context.Canceled, wantCalls: 1},
+		{name: "timed out", initErr: context.DeadlineExceeded, wantCalls: 1},
 		{name: "wrapped RPC", initErr: fmt.Errorf("rpcDoRequest: %w", errTakeoutInit), wantCalls: 1},
+		{name: "caller canceled", cancelCaller: true, wantCalls: 2},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			api := &fakeAPI{initErr: test.initErr}
 			p := newPool(api, 1)
 			ctx := t.Context()
-			first := takeoutWithin(t, p, 2, 2*time.Second)
+			initCtx, cancel := context.WithCancel(ctx)
+			defer cancel()
+			if test.cancelCaller {
+				cancel()
+			}
+			first := p.Takeout(initCtx, 2)
 			if _, err := first.HelpGetConfig(ctx); !errors.Is(err, errStub) {
 				t.Fatalf("first HelpGetConfig error = %v, want %v", err, errStub)
+			}
+			if wantLatched := !test.cancelCaller; p.takeoutFailed != wantLatched || p.takeout != 0 {
+				t.Errorf("takeout after first failure: latched = %t, id = %d, want %t and 0", p.takeoutFailed, p.takeout, wantLatched)
 			}
 			api.initErr = nil
 			second := takeoutWithin(t, p, 2, 2*time.Second)
@@ -198,8 +216,29 @@ func TestTakeoutInitTimeout(t *testing.T) {
 		if len(api.invoker.inputs) != 1 || !isPlainConfigRequest(api.invoker.inputs[0]) {
 			t.Errorf("requests after timeout = %v, want one plain config request", api.invoker.inputs)
 		}
-		if p.takeoutFailed || p.takeout != 0 {
-			t.Error("timeout changed the takeout state from never tried")
+		if !p.takeoutFailed || p.takeout != 0 {
+			t.Error("timeout did not latch takeout off")
+		}
+	})
+}
+
+func TestClientBoundsDCCreation(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		api := &fakeAPI{blockDC: true}
+		p := newPool(api, 1)
+		ctx, cancel := context.WithTimeout(t.Context(), 31*time.Second)
+		defer cancel()
+
+		start := time.Now()
+		client := p.Client(ctx, 4)
+		if elapsed := time.Since(start); elapsed != 30*time.Second {
+			t.Errorf("DC creation took %v, want 30s", elapsed)
+		}
+		if err := ctx.Err(); err != nil {
+			t.Errorf("parent context error = %v, want nil", err)
+		}
+		if client.Invoker() != api {
+			t.Errorf("client invoker = %T, want degraded API client", client.Invoker())
 		}
 	})
 }
@@ -241,6 +280,7 @@ func TestTakeoutConcurrentCallers(t *testing.T) {
 		initErr error
 	}{
 		{name: "init fails", initErr: errTakeoutInit},
+		{name: "network failure", initErr: errStub},
 		{name: "init succeeds"},
 	} {
 		t.Run(tt.name, func(t *testing.T) {

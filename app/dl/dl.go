@@ -141,8 +141,8 @@ func Run(ctx context.Context, c *telegram.Client, kvd storage.Storage, opts Opti
 
 func runDownload(ctx context.Context, d *downloader.Downloader, p *progress, limit int) error {
 	err := d.Download(ctx, limit)
-	if errors.Is(err, context.Canceled) {
-		return err
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return ctxErr
 	}
 	return multierr.Combine(err, p.err())
 }
