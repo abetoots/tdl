@@ -28,7 +28,11 @@ Tracking: abetoots/tdl#1
 - **gotd/contrib:** stays at v0.20.0.
 - **No bulk updates:** no `go get -u`, no `go work sync`.
 - **Tests in `core` use only the standard `testing` package.** testify is `// indirect` in `core/go.mod`, and importing it would change that file. Root tests may use testify, as `app/dl/iter_resume_test.go` does.
-- **Tests run in each module.** Run `go test ./...` from `.`, from `core` and from `extension`; CI's root command doesn't reach `core` or `extension`, so per-module runs are the evidence.
+- **Toolchain:** Go 1.27.4 is installed at `/usr/local/go`, which isn't on the default `PATH`. Run every `go` command with `PATH=/usr/local/go/bin:$PATH GOTOOLCHAIN=go1.25.8`. That uses the checksum-verified 1.25.8 toolchain, the version CI and the release builds read from `go.mod`.
+- **Tests run in each module.**
+  - Root: `go test $(go list ./... | grep -v /test)`, as CI runs it. `test/` is the end-to-end suite, which needs a live server.
+  - `core` and `extension`: `go test ./...` in each.
+  - Root `./...` doesn't reach `core`'s 17 packages (verified in Task 0), so per-module runs are the evidence.
 - **Lint:** `golangci-lint` v2.6.0 with the repo's `.golangci.yaml`, run in `.`, `core` and `extension`.
 - **Builds:** `CGO_ENABLED=0`, `-trimpath`.
 - **Comments:** short, lowercase `//`.
@@ -58,17 +62,17 @@ Tracking: abetoots/tdl#1
 
 This machine has no Go toolchain.
 
-- [ ] **Step 1: Install Go 1.25.8 user-locally (no sudo).**
-  - Download `go1.25.8.linux-amd64.tar.gz` from https://go.dev/dl/.
-  - Check its sha256 against `https://go.dev/dl/?mode=json&include=all`.
-  - Extract it to `~/.local/go1.25.8` and put its `bin` on `PATH`.
-  - Expected: `go version` prints `go version go1.25.8 linux/amd64`.
-- [ ] **Step 2: Install golangci-lint v2.6.0.**
-  - Run: `GOBIN=$HOME/.local/bin go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.6.0`.
-  - Expected: `golangci-lint version` reports 2.6.0.
-- [ ] **Step 3: Record the baseline on `master`.** Record every failure in the tracking notes as pre-existing; don't fix it.
-  - In each of `.`, `core` and `extension`, run `go build ./...`, `go test ./...` and `golangci-lint run`.
-  - In each module, run `GOWORK=off go mod tidy -diff`. This shows any drift that exists before the bump, so it isn't mixed into the bump commit.
+- [x] **Step 1: Toolchain.**
+  - The owner installed Go 1.27.4 at `/usr/local/go`. Its archive sha256 matches go.dev's: `7226736c…dab24840`.
+  - `GOTOOLCHAIN=go1.25.8 go version` fetched and verified 1.25.8, and prints `go version go1.25.8 linux/amd64`.
+- [x] **Step 2: golangci-lint v2.6.0.** Installed with `GOTOOLCHAIN=go1.25.8 GOBIN=$HOME/.local/bin go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.6.0`. It reports `version 2.6.0 built with go1.25.8`.
+- [x] **Step 3: Baseline on `master` (77cb441), 2026-11-26.**
+  - All three modules build.
+  - Root tests pass: 9 packages pass, 18 have none. `core` (17 packages) and `extension` (1) have no tests yet.
+  - `golangci-lint run`: 0 issues in each module.
+  - `GOWORK=off go mod tidy -diff`:
+    - Root has existing drift: `samber/lo` and `yapingcat/gomedia` move from `// indirect` to direct, and `go.sum` doesn't change.
+    - `core` and `extension` are clean.
 
 ### Task 1: Takeout fallback without a deadlock (Phase 1)
 
@@ -141,7 +145,7 @@ Branch: `fix/dl-failure-path`, off `master`.
   - Expected: all PASS.
 - [ ] **Step 6: Lint and run the full tests.**
   - `golangci-lint run` in `core`: expected no issues.
-  - `go test ./...` in each module: expected to match the baseline.
+  - The tests in each module, per Global Constraints: expected to match the baseline, plus the new tests.
 - [ ] **Step 7: Commit.** Message `fix(dcpool): don't deadlock when takeout init fails`. The body names 5e57a13 and ec66ab1 and refs abetoots/tdl#1.
 
 ### Task 2: Report every download outcome and always close its progress bar (Phase 1)
@@ -254,7 +258,7 @@ Branch: `fix/dl-failure-path`, after Task 1.
   - Expected: all PASS.
 - [ ] **Step 7: Lint and run the full tests.**
   - `golangci-lint run` in `.` and in `core`: expected no issues.
-  - `go test ./...` in each module: expected to match the baseline.
+  - The tests in each module, per Global Constraints: expected to match the baseline, plus the new tests.
 - [ ] **Step 8: Commit.** Message `fix(dl): report every download outcome and always close its progress bar`. The body refs iyear/tdl#1430 (the download half), iyear/tdl#1146 and abetoots/tdl#1.
 
 ### Task 3: Bump gotd/td to v0.166.1 (Phase 2)
@@ -292,7 +296,7 @@ Branch: `deps/gotd-v0.166.1`, off `master`.
     - `gotd/contrib` stays at v0.20.0;
     - any other change matches Task 0's `tidy -diff` drift, or is explained in Step 5.
 - [ ] **Step 4: Build, vet, test and lint, in workspace mode.**
-  - In each of `.`, `core` and `extension`: `go build ./...`, `go vet ./...`, `go test ./...` and `golangci-lint run`.
+  - In each of `.`, `core` and `extension`: `go build ./...`, `go vet ./...`, the tests per Global Constraints, and `golangci-lint run`.
   - Expected: tests and lint match the baseline.
   - **If any file other than `core/tclient/tclient.go` fails to compile, stop and report the errors.** That file is outside this round's paths.
 - [ ] **Step 5: Supply-chain review.** Record the after sets the same way as Step 1.
