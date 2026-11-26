@@ -17,17 +17,12 @@ builds:
       - linux
       - windows
       - darwin
+    # 32-bit targets dropped: gotd v0.154+ panics on unaligned 64-bit atomics (gotd#1985)
     goarch:
-      - 386
       - amd64
-      - arm
       - arm64
       - riscv64
       - loong64
-    goarm:
-      - 5
-      - 6
-      - 7
 checksum:
   name_template: '{{ .ProjectName }}_checksums.txt'
 archives:

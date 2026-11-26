@@ -70,7 +70,8 @@ jobs:
             VERSION=${{ steps.meta.outputs.version }}
             COMMIT=${{ steps.args.outputs.commit }}
             COMMIT_DATE=${{ steps.args.outputs.commit_date }}
-          platforms: linux/amd64,linux/386,linux/arm64,linux/arm/v7,linux/arm/v6,linux/riscv64
+          # 32-bit targets dropped: gotd v0.154+ panics on unaligned 64-bit atomics (gotd#1985)
+          platforms: linux/amd64,linux/arm64,linux/riscv64
           push: true
           provenance: false
           tags: ${{ steps.meta.outputs.tags }}
