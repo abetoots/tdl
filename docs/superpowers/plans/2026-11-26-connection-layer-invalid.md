@@ -27,6 +27,7 @@ Tracking: abetoots/tdl#1
 - **gotd/td pin:** exactly `v0.166.1`, in all three `go.mod` files, in one commit.
 - **gotd/contrib:** stays at v0.20.0.
 - **No bulk updates:** no `go get -u`, no `go work sync`.
+- **Tests in `core` use only the standard `testing` package.** testify is `// indirect` in `core/go.mod`, and importing it would change that file. Root tests may use testify, as `app/dl/iter_resume_test.go` does.
 - **Tests run in each module.** Run `go test ./...` from `.`, from `core` and from `extension`; CI's root command doesn't reach `core` or `extension`, so per-module runs are the evidence.
 - **Lint:** `golangci-lint` v2.6.0 with the repo's `.golangci.yaml`, run in `.`, `core` and `extension`.
 - **Builds:** `CGO_ENABLED=0`, `-trimpath`.
@@ -95,7 +96,7 @@ Branch: `fix/dl-failure-path`, off `master`.
   - Add `apiClient` and `newPool`. `NewPool` returns `newPool(c, size, middlewares...)`.
   - Run: `go build ./... && go test ./...` in `core`.
   - Expected: both pass.
-- [ ] **Step 2: Write the failing tests in `core/dcpool/dcpool_test.go`.** The test file uses `package dcpool`.
+- [ ] **Step 2: Write the failing tests in `core/dcpool/dcpool_test.go`.** The test file uses `package dcpool` and the standard `testing` package.
   - **Fakes:**
     - `fakeAPI` implements `apiClient`:
       - `Config()` returns `tg.Config{ThisDC: 2}`.
@@ -176,13 +177,17 @@ Branch: `fix/dl-failure-path`, after Task 1.
 - Behaviour after this task:
   - `OnDone` receives the transfer's real error.
   - `Download` waits for its workers before returning, as `Uploader` does.
-  - `OnDone` always closes the bar. It marks it errored on any error; the red log line is printed only when the error isn't a cancel. It marks it done after successful post-processing.
-  - A file is recorded as finished only after its rename and `Chtimes` succeed.
+  - `OnDone` always closes the bar:
+    - it marks it errored on any error, printing the red log line only when the error isn't a cancel;
+    - it marks it done after successful post-processing, if the bar isn't done already.
+  - go-pretty ignores "errored" on a bar that's already full. So a post-processing failure after a full transfer still shows `done!`, next to the red log line.
+  - In every failure case, the file isn't recorded as finished. A file is recorded as finished only after its rename and `Chtimes` succeed.
+  - On an iterator error, in-flight downloads run to completion and are recorded, as in `Uploader`. Ctrl+C still cancels them through the parent context.
 - `core/forwarder` uses only `MaxPartSize`. `app/dl/progress.go` is the only `Progress` implementation.
 
-- [ ] **Step 1: Write the failing downloader tests in `core/downloader/downloader_test.go`.** The test file uses `package downloader`.
+- [ ] **Step 1: Write the failing downloader tests in `core/downloader/downloader_test.go`.** The test file uses `package downloader` and the standard `testing` package.
   - **Fakes:**
-    - `fakeIter` yields the given elements. Before reporting the end, it waits for an optional `waitBeforeEnd` channel; after 2 seconds it calls `t.Error("worker never started")` and ends. `Err()` returns a configured error.
+    - `fakeIter` yields the given elements. Before reporting the end, it waits for an optional `waitBeforeEnd` channel or `ctx.Done()`, and never calls `t` itself. `Err()` returns a configured error.
     - `fakeElem`:
       - `File()` returns DC 2, size `1 << 20`, and location `&tg.InputDocumentFileLocation{}`;
       - `To()` returns an in-memory `io.WriterAt`;
@@ -192,7 +197,7 @@ Branch: `fix/dl-failure-path`, after Task 1.
     - Invokers:
       - `errInvoker` returns `tgerr.New(400, "CONNECTION_LAYER_INVALID")`. gotd v0.140.0's reader retries only flood wait and `TIMEOUT`, so the error comes back at once.
       - `releaseInvoker` closes `entered` once, then waits for `release` (or `ctx.Done()`) and returns `errStub`.
-    - Use `Options{Threads: 1}`.
+    - Build the downloader with `New(Options{Pool: pool, Threads: 1, Iter: iter, Progress: progress})`, using the fakes above.
   - **`TestDownloadReportsFailedTransfer`:**
     - One element, with `errInvoker`.
     - Assert `d.Download(ctx, 1)` returns nil.
@@ -200,7 +205,8 @@ Branch: `fix/dl-failure-path`, after Task 1.
   - **`TestDownloadIterErrorWaitsForWorkers`:**
     - One element, with `releaseInvoker`. The iter's `waitBeforeEnd` is `inv.entered`, and `Err()` returns `errIter`.
     - Run `Download` in a goroutine.
-    - If it returns within 100 ms, `t.Fatal("Download returned before its worker finished")`.
+    - On the test goroutine, wait for `inv.entered`, and `t.Fatal("worker never started")` if it takes more than 2 seconds.
+    - Then, if `Download` returns within 100 ms, `t.Fatal("Download returned before its worker finished")`.
     - Then `close(release)`. It must return within 2 seconds.
     - Assert `errors.Is(err, errIter)`, and that `OnDone` was called once, with `errors.Is(err, errStub)`.
     - Cancel the test context in `t.Cleanup`, so a worker left blocked by the unfixed code exits.
@@ -213,6 +219,7 @@ Branch: `fix/dl-failure-path`, after Task 1.
       - `file: &tmedia.Media{Name: "a.bin", Size: 1 << 20}`;
       - `fromMsg: &tg.Message{ID: 1}`;
       - `from`: a `fakePeer` that embeds `peers.Peer` and overrides only `ID()` and `VisibleName()`.
+    - A helper builds a fresh `progress`, `iter`, element and temp file for every test and subtest. A shared file would make the second `OnDone` fail on "file already closed" and pass by accident.
     - Each test calls `p.OnAdd(elem)` first, and reads the tracker back with `p.trackers.Load(1)`.
   - **`TestOnDoneClosesBarOnError`:** subtests `canceled` (`context.Canceled`) and `failed` (`errors.New("boom")`). After `p.OnDone(elem, err)`, assert:
     - `tracker.IsDone()` and `tracker.IsErrored()`;
@@ -222,9 +229,10 @@ Branch: `fix/dl-failure-path`, after Task 1.
     - `tracker.IsDone()` and not `tracker.IsErrored()`;
     - position 7 is in `it.Finished()`;
     - `a.bin` exists.
-  - **`TestOnDoneRenameFailureNotFinished`:** create a directory at `<dir>/a.bin` first, so the rename fails. After `p.OnDone(elem, nil)`, assert:
-    - `tracker.IsErrored()`;
-    - position 7 isn't in `it.Finished()`.
+  - **`TestOnDoneRenameFailureNotFinished`:**
+    - Create a directory at `<dir>/a.bin` first, so the rename fails.
+    - Call `p.OnDownload(elem, downloader.ProgressState{Downloaded: 1 << 20, Total: 1 << 20})`, so the bar is full, as in a real transfer.
+    - After `p.OnDone(elem, nil)`, assert that position 7 isn't in `it.Finished()`.
 - [ ] **Step 3: Run the tests and confirm they fail for the right reason.**
   - Run: `go test -race ./downloader/ -v` in `core`, and `go test -race ./app/dl/ -v` in `.`.
   - Expected to FAIL:
@@ -239,7 +247,8 @@ Branch: `fix/dl-failure-path`, after Task 1.
   - Copy `Uploader`'s ending: `workerErr := wg.Wait()`, then return `errors.Wrap(err, "iter")` if `Iter.Err()` is set, otherwise `workerErr`.
 - [ ] **Step 5: Fix `OnDone`.**
   - **On a non-nil error:** if `errors.Is(err, context.Canceled)`, call `t.MarkAsErrored()` with no log line; otherwise call `p.fail` as today. Remove the temp file, and return.
-  - **On success:** run `donePost` first, and on an error call `p.fail` and return. Then call `p.it.Finish(e.logicalPos)` and `t.MarkAsDone()`.
+  - **On success:** run `donePost` first, and on an error call `p.fail` and return. Then call `p.it.Finish(e.logicalPos)`, and `if !t.IsDone() { t.MarkAsDone() }`.
+    - The guard matters: a full bar is already done, and calling `MarkAsDone` again rewrites its stop time while the renderer reads it.
 - [ ] **Step 6: Run the tests and confirm they pass.**
   - Run the two commands from Step 3.
   - Expected: all PASS.
