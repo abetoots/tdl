@@ -2,7 +2,7 @@ package retry
 
 import (
 	"context"
-	"fmt"
+	"time"
 
 	"github.com/go-faster/errors"
 	"github.com/gotd/td/bin"
@@ -30,22 +30,34 @@ type retry struct {
 
 func (r retry) Handle(next tg.Invoker) telegram.InvokeFunc {
 	return func(ctx context.Context, input bin.Encoder, output bin.Decoder) error {
-		retries := 0
-
-		for retries < r.max {
-			if err := next.Invoke(ctx, input, output); err != nil {
-				if tgerr.Is(err, r.errors...) {
-					logctx.From(ctx).Debug("retry middleware", zap.Int("retries", retries), zap.Error(err))
-					retries++
-					continue
+		var lastErr error
+		delay := 4 * time.Second
+		for retries := 0; retries < r.max; retries++ {
+			if retries > 0 {
+				timer := time.NewTimer(delay)
+				select {
+				case <-timer.C:
+				case <-ctx.Done():
+					timer.Stop()
 				}
-				return errors.Wrap(err, "retry middleware skip")
+				if err := ctx.Err(); err != nil {
+					return err
+				}
+				delay *= 2
 			}
 
-			return nil
+			err := next.Invoke(ctx, input, output)
+			if err == nil {
+				return nil
+			}
+			if !tgerr.Is(err, r.errors...) {
+				return errors.Wrap(err, "retry middleware skip")
+			}
+			logctx.From(ctx).Debug("retry middleware", zap.Int("retries", retries), zap.Error(err))
+			lastErr = err
 		}
 
-		return fmt.Errorf("retry limit reached after %d attempts", r.max)
+		return errors.Wrapf(lastErr, "retry limit reached after %d attempts", r.max)
 	}
 }
 
