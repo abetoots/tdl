@@ -49,7 +49,7 @@ jobs:
       - name: Build
         run: go build
       - name: Unit Test
-        run: go test -v $(go list ./... | grep -v /test) # skip e2e test
+        run: go test -race -v $(go list ./... ./core/... ./extension/... | grep -v /test) # skip e2e test
   e2e-test:
     runs-on: ubuntu-22.04
     if: false # skip e2e test for now, since it is not stable

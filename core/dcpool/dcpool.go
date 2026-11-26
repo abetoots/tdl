@@ -111,11 +111,23 @@ func (p *pool) Default(ctx context.Context) *tg.Client {
 }
 
 func (p *pool) Close() (err error) {
-	if p.takeout != 0 {
-		err = takeout.UnTakeout(context.TODO(), p.Takeout(context.TODO(), p.current()).Invoker())
+	ctx := context.TODO()
+	p.mu.Lock()
+	id := p.takeout
+	var finishInvoker tg.Invoker
+	if id != 0 {
+		finishInvoker = chainMiddlewares(p.invoker(ctx, p.current()), takeout.Middleware(id))
 	}
-
+	closes := make([]func() error, 0, len(p.closes))
 	for _, c := range p.closes {
+		closes = append(closes, c)
+	}
+	p.mu.Unlock()
+
+	if id != 0 {
+		err = takeout.UnTakeout(ctx, finishInvoker)
+	}
+	for _, c := range closes {
 		err = multierr.Append(err, c())
 	}
 
