@@ -95,7 +95,7 @@ func List(ctx context.Context, c *telegram.Client, kvd storage.Storage, opts Lis
 		return err
 	}
 
-	manager := peers.Options{Storage: storage.NewPeers(kvd)}.Build(c.API())
+	manager := storage.PeerOptions(kvd).Build(c.API())
 	result := make([]*Dialog, 0, len(dialogs))
 	for _, d := range dialogs {
 		id := tutil.GetInputPeerID(d.Peer)

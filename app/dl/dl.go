@@ -9,7 +9,6 @@ import (
 	"github.com/fatih/color"
 	"github.com/go-faster/errors"
 	"github.com/gotd/td/telegram"
-	"github.com/gotd/td/telegram/peers"
 	"github.com/spf13/viper"
 	"go.uber.org/multierr"
 	"go.uber.org/zap"
@@ -74,7 +73,7 @@ func Run(ctx context.Context, c *telegram.Client, kvd storage.Storage, opts Opti
 		return serve(ctx, kvd, pool, dialogs, opts.Port, opts.Takeout)
 	}
 
-	manager := peers.Options{Storage: storage.NewPeers(kvd)}.Build(pool.Default(ctx))
+	manager := storage.PeerOptions(kvd).Build(pool.Default(ctx))
 
 	it, err := newIter(pool, manager, dialogs, opts, viper.GetDuration(consts.FlagDelay))
 	if err != nil {

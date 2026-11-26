@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 
 	"github.com/gotd/td/telegram"
 
@@ -43,12 +44,18 @@ func (s *Session) LoadSession(ctx context.Context) ([]byte, error) {
 	if err := json.Unmarshal(envelope["Data"], &data); err != nil {
 		return b, nil
 	}
-	if _, ok := data["DCs"]; !ok {
+	// dcpool can't recover revoked non-home dc keys, so transfer authorization each run.
+	removed := false
+	for key := range data {
+		if strings.EqualFold(key, "DCs") {
+			delete(data, key)
+			removed = true
+		}
+	}
+	if !removed {
 		return b, nil
 	}
 
-	// gotd v0.166+ stores other DCs' keys as authorized; tdl's dcpool can't recover a revoked one, so drop them and transfer each run (as v0.140 did)
-	delete(data, "DCs")
 	envelope["Data"], err = json.Marshal(data)
 	if err != nil {
 		return b, nil

@@ -21,7 +21,10 @@ func (s sessionTestStorage) Get(context.Context, string) ([]byte, error) {
 
 func TestLoadSession(t *testing.T) {
 	const fields = `"DC":2,"AuthKey":"AQID","ServerTimeOffset":123,"UserID":9007199254740993,"FutureField":{"Enabled":true}`
-	const want = `{"Version":1,"Data":{` + fields + `},"FutureEnvelopeField":[1]}`
+	const dcKeys = `{"4":{"AuthKey":"BAUG","Authorized":true}}`
+	const prefix = `{"Version":1,"Data":{` + fields
+	const suffix = `},"FutureEnvelopeField":[1]}`
+	const want = prefix + suffix
 	decode := func(t *testing.T, data []byte) any {
 		t.Helper()
 		decoder := json.NewDecoder(bytes.NewReader(data))
@@ -38,7 +41,10 @@ func TestLoadSession(t *testing.T) {
 		name string
 		data string
 	}{
-		{"with DCs", `{"Version":1,"Data":{` + fields + `,"DCs":{"4":{"AuthKey":"BAUG","Authorized":true}}},"FutureEnvelopeField":[1]}`},
+		{"with DCs", prefix + `,"DCs":` + dcKeys + suffix},
+		{"with Dcs", prefix + `,"Dcs":` + dcKeys + suffix},
+		{"with dcs", prefix + `,"dcs":` + dcKeys + suffix},
+		{"with DCs and DCS", prefix + `,"DCs":` + dcKeys + `,"DCS":` + dcKeys + suffix},
 		{"without DCs", "\n" + want},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

@@ -74,7 +74,7 @@ func Run(ctx context.Context, c *telegram.Client, kvd storage.Storage, opts Opti
 		tclient.NewDefaultMiddlewares(ctx, viper.GetDuration(consts.FlagReconnectTimeout))...)
 	defer multierr.AppendInvoke(&rerr, multierr.Close(pool))
 
-	manager := peers.Options{Storage: storage.NewPeers(kvd)}.Build(pool.Default(ctx))
+	manager := storage.PeerOptions(kvd).Build(pool.Default(ctx))
 
 	to, err := resolveDest(ctx, manager, opts.To)
 	if err != nil {

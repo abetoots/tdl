@@ -38,7 +38,7 @@ type User struct {
 }
 
 func Users(ctx context.Context, c *telegram.Client, kvd storage.Storage, opts UsersOptions) (rerr error) {
-	manager := peers.Options{Storage: storage.NewPeers(kvd)}.Build(c.API())
+	manager := storage.PeerOptions(kvd).Build(c.API())
 	if opts.Chat == "" {
 		return fmt.Errorf("missing domain id")
 	}
