@@ -27,18 +27,30 @@ type Pool interface {
 	Close() error
 }
 
+type apiClient interface {
+	tg.Invoker
+	Config() tg.Config
+	Pool(max int64) (telegram.CloseInvoker, error)
+	DC(ctx context.Context, dc int, max int64) (telegram.CloseInvoker, error)
+}
+
 type pool struct {
-	api         *telegram.Client
+	api         apiClient
 	size        int64
 	mu          *sync.Mutex
 	middlewares []telegram.Middleware
 
-	invokers map[int]tg.Invoker
-	closes   map[int]func() error
-	takeout  int64
+	invokers      map[int]tg.Invoker
+	closes        map[int]func() error
+	takeout       int64
+	takeoutFailed bool
 }
 
 func NewPool(c *telegram.Client, size int64, middlewares ...telegram.Middleware) Pool {
+	return newPool(c, size, middlewares...)
+}
+
+func newPool(c apiClient, size int64, middlewares ...telegram.Middleware) *pool {
 	return &pool{
 		api:         c,
 		size:        size,
@@ -115,15 +127,20 @@ func (p *pool) Takeout(ctx context.Context, dc int) *tg.Client {
 	defer p.mu.Unlock()
 
 	// lazy init
-	if p.takeout == 0 {
+	if p.takeout == 0 && !p.takeoutFailed {
 		sid, err := takeout.Takeout(ctx, p.api)
 		if err != nil {
+			p.takeoutFailed = true
 			logctx.From(ctx).Warn("takeout error", zap.Error(err))
-			// ignore init delay error and return non-takeout client
-			return p.Client(ctx, dc)
+		} else {
+			p.takeout = sid
+			logctx.From(ctx).Info("get takeout id", zap.Int64("id", sid))
 		}
-		p.takeout = sid
-		logctx.From(ctx).Info("get takeout id", zap.Int64("id", sid))
+	}
+
+	if p.takeout == 0 {
+		// p.mu is held: use p.invoker, not p.Client
+		return tg.NewClient(p.invoker(ctx, dc))
 	}
 
 	return tg.NewClient(chainMiddlewares(p.invoker(ctx, dc), takeout.Middleware(p.takeout)))
