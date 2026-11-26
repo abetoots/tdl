@@ -6,11 +6,12 @@
 - `tdl dl` keeps going when Telegram drops a session's connection state.
 - `--takeout` falls back to a normal client, instead of hanging, when the takeout session can't start.
 - A file whose download fails is reported as failed, not recorded as finished.
+- `tdl dl` exits on its own: every download's progress bar closes, whatever the outcome.
 
 **Architecture:** There are two independent branches and pull requests off `master` (77cb441).
 - **Phase 1** fixes two tdl bugs on the original failure path, each test-first with fakes:
   - Task 1: a lock taken twice in `core/dcpool`;
-  - Task 2: in `core/downloader`, failed transfers are reported as done.
+  - Task 2: `core/downloader` reports failed transfers as done and doesn't join its workers on an iterator error. Some outcomes in `app/dl/progress.go` leave the progress bar open, so tdl can hang at exit.
 - **Phase 2** (Task 3) bumps gotd/td from v0.140.0 to v0.166.1. That version re-sends `initConnection` after `CONNECTION_LAYER_INVALID` or `CONNECTION_NOT_INITED` (gotd #1954 and #1964). Task 3 also makes the one compile fix the bump needs.
 - **Task 4** is the owner's smoke test of a combined build.
 
@@ -45,7 +46,7 @@ Tracking: abetoots/tdl#1
 ## Review Focus
 
 1. **A transfer fails partway** (for example `CONNECTION_LAYER_INVALID` on a file connection). It must be reported as failed and must not be recorded as finished. Covered by `TestDownloadReportsFailedTransfer` in Task 2.
-2. **The run exits on its own after failed transfers.** Each failed file's progress bar must close, or `dl.Run`'s deferred `prog.Wait` waits forever. `app/dl/progress.go:70-73` marks a non-cancel error as errored, which closes the bar. Covered by Task 4, Step 3, which requires the command to exit by itself.
+2. **The run exits on its own, whatever happened to each file.** That includes a transfer that ends in `context.Canceled` while the run itself isn't cancelled. Every progress bar must close, or `dl.Run`'s deferred `prog.Wait` waits forever. Covered by `TestOnDoneClosesBarOnError` and `TestOnDoneSuccessClosesBar` in Task 2.
 3. **`--takeout` with a failing init while other downloads call the pool at the same time.** Every caller must return and get a working client, and init must run once. Covered by `TestTakeoutConcurrentCallers` in Task 1.
 4. **Takeout cleanup at exit.** A run whose takeout init failed must not send `account.finishTakeoutSession`; a run whose init succeeded sends it once, wrapped. Covered by `TestCloseFinishesTakeoutOnlyWhenStarted` in Task 1.
 5. **A session saved by a v0.140.0 build** must still load after the bump. Covered by gotd's `TestDataOldFormat` in Task 3, Step 6, and by Task 4.
@@ -142,55 +143,110 @@ Branch: `fix/dl-failure-path`, off `master`.
   - `go test ./...` in each module: expected to match the baseline.
 - [ ] **Step 7: Commit.** Message `fix(dcpool): don't deadlock when takeout init fails`. The body names 5e57a13 and ec66ab1 and refs abetoots/tdl#1.
 
-### Task 2: Report failed downloads as failed (Phase 1)
+### Task 2: Report every download outcome and always close its progress bar (Phase 1)
 
 Branch: `fix/dl-failure-path`, after Task 1.
 
-**Cause:**
-- In `core/downloader/downloader.go`, a worker that hits a download error other than cancellation logs it and returns nil, and its deferred `OnDone` gets that nil.
-- `app/dl/progress.go` then marks the element finished (`:78`) and renames the partial temp file to its final name (`:101`).
-- `--continue` skips that file from then on. This is the download half of iyear/tdl#1430.
+**Cause:** four defects on the failure path.
+1. **Failed transfers are reported as done.**
+   - In `core/downloader/downloader.go`, a worker that hits a non-cancel download error logs it and returns nil, so its deferred `OnDone` gets nil.
+   - `app/dl/progress.go` then records the file finished (`:78`) and renames the partial temp file to its final name (`:101`).
+   - `--continue` skips it from then on. This is the download half of iyear/tdl#1430.
+2. **Workers aren't joined on an iterator error.** `Download` returns without waiting, unlike `core/uploader/uploader.go:85-89`. `dl.Run`'s `prog.Wait` can then see no active bars:
+   - before a worker has called `OnAdd`;
+   - or after a bar fills, but before `OnDone` finishes.
 
-**Not changed:** `Download` returns an iterator error without joining its workers. That's harmless in tdl, because `dl.Run`'s deferred `prog.Wait` (`app/dl/dl.go:124`) runs before `saveProgress` and `pool.Close()`, and waits for every active progress bar. Only Ctrl+C can close the pool under a worker. This is recorded under Deferred.
+   Progress is then saved without that file, and the pool is closed under it.
+3. **A cancelled transfer leaves its bar open** (`app/dl/progress.go:70-75`).
+   - gotd returns `engine forcibly closed: context canceled` when a pooled connection dies mid-request, while the run's own context is still alive.
+   - Once tdl's recovery retries run out (`--reconnect-timeout`, 5 minutes), the errgroup cancels every worker.
+   - Every bar stays open, and `prog.Wait` loops forever with no output.
+4. **A file is marked finished before it's renamed** (`:78-83`).
+   - A failed rename, such as Windows' "used by another process" (iyear/tdl#1146), still records the file as finished.
+   - A successful transfer whose byte count never reaches the bar's total leaves the bar open.
 
 **Files:**
-- Modify: `core/downloader/downloader.go` (the worker in `Download`)
+- Modify: `core/downloader/downloader.go` (`Download`)
 - Create: `core/downloader/downloader_test.go`
+- Modify: `app/dl/progress.go` (`OnDone`)
+- Create: `app/dl/progress_test.go`
 
 **Interfaces:**
-- Unchanged: `Download(ctx context.Context, limit int) error`, and the `Iter`, `Elem`, `File` and `Progress` interfaces.
-- Behaviour change for callers: `Progress.OnDone` receives the transfer's real error.
-  - `app/dl/progress.go`, the only `Progress` implementation, already handles a non-cancel error. It reports the failure, calls `MarkAsErrored` (which closes the bar, so `prog.Wait` still ends), removes the temp file, and doesn't mark the file finished.
-  - `core/forwarder` uses only `MaxPartSize`.
+- Unchanged signatures: `Download(ctx context.Context, limit int) error`, `OnDone(elem downloader.Elem, err error)`, and the `Iter`, `Elem`, `File` and `Progress` interfaces.
+- Behaviour after this task:
+  - `OnDone` receives the transfer's real error.
+  - `Download` waits for its workers before returning, as `Uploader` does.
+  - `OnDone` always closes the bar. It marks it errored on any error; the red log line is printed only when the error isn't a cancel. It marks it done after successful post-processing.
+  - A file is recorded as finished only after its rename and `Chtimes` succeed.
+- `core/forwarder` uses only `MaxPartSize`. `app/dl/progress.go` is the only `Progress` implementation.
 
-- [ ] **Step 1: Write the failing test in `core/downloader/downloader_test.go`.** The test file uses `package downloader`.
+- [ ] **Step 1: Write the failing downloader tests in `core/downloader/downloader_test.go`.** The test file uses `package downloader`.
   - **Fakes:**
-    - `fakeIter` yields the given elements, then ends with a nil `Err()`.
+    - `fakeIter` yields the given elements. Before reporting the end, it waits for an optional `waitBeforeEnd` channel; after 2 seconds it calls `t.Error("worker never started")` and ends. `Err()` returns a configured error.
     - `fakeElem`:
       - `File()` returns DC 2, size `1 << 20`, and location `&tg.InputDocumentFileLocation{}`;
       - `To()` returns an in-memory `io.WriterAt`;
       - `AsTakeout()` returns false.
     - `fakeProgress` records every `OnDone` error under a mutex. `OnAdd` and `OnDownload` do nothing.
-    - `fakePool` implements `dcpool.Pool`: `Client`, `Default` and `Takeout` return `tg.NewClient(errInvoker{})`, and `Close` returns nil.
-    - `errInvoker` returns `tgerr.New(400, "CONNECTION_LAYER_INVALID")`. gotd v0.140.0's reader retries only flood wait and `TIMEOUT`, so the error comes back at once.
+    - `fakePool` implements `dcpool.Pool`: `Client`, `Default` and `Takeout` return `tg.NewClient(inv)`, and `Close` returns nil.
+    - Invokers:
+      - `errInvoker` returns `tgerr.New(400, "CONNECTION_LAYER_INVALID")`. gotd v0.140.0's reader retries only flood wait and `TIMEOUT`, so the error comes back at once.
+      - `releaseInvoker` closes `entered` once, then waits for `release` (or `ctx.Done()`) and returns `errStub`.
     - Use `Options{Threads: 1}`.
   - **`TestDownloadReportsFailedTransfer`:**
-    - One element.
-    - Assert `d.Download(ctx, 1)` returns nil, so other downloads aren't stopped.
+    - One element, with `errInvoker`.
+    - Assert `d.Download(ctx, 1)` returns nil.
     - Assert `OnDone` was called once, with an error where `tgerr.Is(err, "CONNECTION_LAYER_INVALID")`.
-- [ ] **Step 2: Run the test and confirm it fails for the right reason.**
-  - Run: `go test -race ./downloader/ -v` in `core`.
-  - Expected: FAIL, because `OnDone`'s error is nil.
-- [ ] **Step 3: Fix the worker.**
-  - Pass the `d.download` error to `OnDone` unchanged.
-  - Keep the rest as today: return the error to the errgroup only when `errors.Is(err, context.Canceled)`, and only log other errors.
-- [ ] **Step 4: Run the test and confirm it passes.**
-  - Run: `go test -race ./downloader/ -v` in `core`.
-  - Expected: PASS.
-- [ ] **Step 5: Lint and run the full tests.**
-  - `golangci-lint run` in `core`: expected no issues.
+  - **`TestDownloadIterErrorWaitsForWorkers`:**
+    - One element, with `releaseInvoker`. The iter's `waitBeforeEnd` is `inv.entered`, and `Err()` returns `errIter`.
+    - Run `Download` in a goroutine.
+    - If it returns within 100 ms, `t.Fatal("Download returned before its worker finished")`.
+    - Then `close(release)`. It must return within 2 seconds.
+    - Assert `errors.Is(err, errIter)`, and that `OnDone` was called once, with `errors.Is(err, errStub)`.
+    - Cancel the test context in `t.Cleanup`, so a worker left blocked by the unfixed code exits.
+- [ ] **Step 2: Write the failing progress tests in `app/dl/progress_test.go`.** The test file uses `package dl`.
+  - **Setup:**
+    - `p := newProgress(pw.NewWriter(), it, Options{})`, with `it := &iter{mu: &sync.Mutex{}, finished: map[int]struct{}{}}`.
+    - The element is an `*iterElem` with:
+      - `id: 1`, `logicalPos: 7`;
+      - `to`: a file created at `<t.TempDir()>/a.bin.tmp`;
+      - `file: &tmedia.Media{Name: "a.bin", Size: 1 << 20}`;
+      - `fromMsg: &tg.Message{ID: 1}`;
+      - `from`: a `fakePeer` that embeds `peers.Peer` and overrides only `ID()` and `VisibleName()`.
+    - Each test calls `p.OnAdd(elem)` first, and reads the tracker back with `p.trackers.Load(1)`.
+  - **`TestOnDoneClosesBarOnError`:** subtests `canceled` (`context.Canceled`) and `failed` (`errors.New("boom")`). After `p.OnDone(elem, err)`, assert:
+    - `tracker.IsDone()` and `tracker.IsErrored()`;
+    - position 7 isn't in `it.Finished()`;
+    - the `.tmp` file is gone.
+  - **`TestOnDoneSuccessClosesBar`:** no `OnDownload` call, so the bar never reaches its total. After `p.OnDone(elem, nil)`, assert:
+    - `tracker.IsDone()` and not `tracker.IsErrored()`;
+    - position 7 is in `it.Finished()`;
+    - `a.bin` exists.
+  - **`TestOnDoneRenameFailureNotFinished`:** create a directory at `<dir>/a.bin` first, so the rename fails. After `p.OnDone(elem, nil)`, assert:
+    - `tracker.IsErrored()`;
+    - position 7 isn't in `it.Finished()`.
+- [ ] **Step 3: Run the tests and confirm they fail for the right reason.**
+  - Run: `go test -race ./downloader/ -v` in `core`, and `go test -race ./app/dl/ -v` in `.`.
+  - Expected to FAIL:
+    - `TestDownloadReportsFailedTransfer`: `OnDone`'s error is nil;
+    - `TestDownloadIterErrorWaitsForWorkers`: it returned before its worker finished;
+    - `TestOnDoneClosesBarOnError/canceled`: the bar isn't done;
+    - `TestOnDoneSuccessClosesBar`: the bar isn't done;
+    - `TestOnDoneRenameFailureNotFinished`: position 7 is finished.
+  - Expected to PASS: `TestOnDoneClosesBarOnError/failed`.
+- [ ] **Step 4: Fix `Download`.**
+  - Pass the `d.download` error to `OnDone` unchanged. Return it to the errgroup only when `errors.Is(err, context.Canceled)`, and only log other errors, as today.
+  - Copy `Uploader`'s ending: `workerErr := wg.Wait()`, then return `errors.Wrap(err, "iter")` if `Iter.Err()` is set, otherwise `workerErr`.
+- [ ] **Step 5: Fix `OnDone`.**
+  - **On a non-nil error:** if `errors.Is(err, context.Canceled)`, call `t.MarkAsErrored()` with no log line; otherwise call `p.fail` as today. Remove the temp file, and return.
+  - **On success:** run `donePost` first, and on an error call `p.fail` and return. Then call `p.it.Finish(e.logicalPos)` and `t.MarkAsDone()`.
+- [ ] **Step 6: Run the tests and confirm they pass.**
+  - Run the two commands from Step 3.
+  - Expected: all PASS.
+- [ ] **Step 7: Lint and run the full tests.**
+  - `golangci-lint run` in `.` and in `core`: expected no issues.
   - `go test ./...` in each module: expected to match the baseline.
-- [ ] **Step 6: Commit.** Message `fix(downloader): report failed downloads as failed`. The body refs iyear/tdl#1430 (the download half) and abetoots/tdl#1.
+- [ ] **Step 8: Commit.** Message `fix(dl): report every download outcome and always close its progress bar`. The body refs iyear/tdl#1430 (the download half), iyear/tdl#1146 and abetoots/tdl#1.
 
 ### Task 3: Bump gotd/td to v0.166.1 (Phase 2)
 
@@ -209,9 +265,9 @@ Branch: `deps/gotd-v0.166.1`, off `master`.
 
 **Interfaces:** none produced. Nothing is used from Phase 1.
 
-- [ ] **Step 1: Record the module sets before the bump**, saved to the scratchpad. From the repo root, in workspace mode, with `set -o pipefail` so a failed listing stops the step:
+- [ ] **Step 1: Record the module sets before the bump**, saved to the scratchpad. Run from the repo root, in workspace mode, and stop if any command fails:
   - **All selected modules:** `go list -m -f '{{.Path}}@{{.Version}}' all | sort > mods-before.txt`.
-  - **Modules compiled into the two deliverables:** `for os in linux windows; do GOOS=$os GOARCH=amd64 go list -deps -f '{{with .Module}}{{.Path}}@{{.Version}}{{end}}' .; done | sort -u > compiled-before.txt`.
+  - **Modules compiled into the two deliverables:** `for os in linux windows; do CGO_ENABLED=0 GOOS=$os GOARCH=amd64 go list -deps -f '{{with .Module}}{{.Path}}@{{.Version}}{{end}}' . > compiled-$os.txt || exit 1; done; sort -u compiled-linux.txt compiled-windows.txt > compiled-before.txt`.
 - [ ] **Step 2: Fix the `Logger` field.** In `core/tclient/tclient.go`, use `Logger: logzap.New(logctx.From(ctx).Named("td"))` and import `github.com/gotd/log/logzap`.
 - [ ] **Step 3: Resolve the new versions.** These commands ignore `go.work`, so set `GOWORK=off` explicitly.
   - In `core`: `GOWORK=off go get github.com/gotd/td@v0.166.1 github.com/gotd/log/logzap@v0.1.1`.
@@ -233,7 +289,7 @@ Branch: `deps/gotd-v0.166.1`, off `master`.
 - [ ] **Step 5: Supply-chain review.** Record the after sets the same way as Step 1.
   - **The review surface** is the compiled-in diff, `compiled-before.txt` against `compiled-after.txt`.
   - For each new or moved compiled-in `path@version`:
-    - **Requirer:** `for d in . core extension; do (cd $d && GOWORK=off go mod graph); done | awk '$2 == "<path>@<version>"'` must name `github.com/gotd/td@v0.166.1`, `github.com/gotd/log/logzap@v0.1.1`, or a module that one of them requires.
+    - **Requirer:** the two pins this step adds, `github.com/gotd/td@v0.166.1` and `github.com/gotd/log/logzap@v0.1.1`, skip this check, since tdl's own modules require them. Every other version is checked with `for d in . core extension; do (cd $d && GOWORK=off go mod graph); done | awk '$2 == "<path>@<version>"'`, which must name one of the two pins, or a module that one of them requires.
     - **Age:** find publication evidence for each version: its GitHub release or tag date (for `golang.org/x` and `go.opentelemetry.io`, their GitHub mirrors). `go list -m -json … .Time` alone isn't enough, because it can be an old commit date on a new tag.
     - **Stop** if it's younger than 3 days. With no evidence, list it as unverified in the pull request.
   - List the all-modules diff (`mods-before.txt` against `mods-after.txt`) in the pull request as "in go.sum only, not compiled".
@@ -279,16 +335,25 @@ This needs the owner's account and can't run here.
   - Leave out `--debug`. The default Info level already logs the strings below, and debug output rotates `latest.log` sooner (10 MB, 3 gzip backups).
   - Let it run at least as long as the failed run did before it aborted, or to the end.
   - **Pass:**
-    - it ends by itself with exit code 0 and no `CONNECTION_LAYER_INVALID` abort. If you stop it with Ctrl+C, it exits within a few seconds;
+    - it ends by itself, with no `CONNECTION_LAYER_INVALID` abort. If you stop it with Ctrl+C, it exits within a few seconds;
     - at least one file was downloaded, and its size matches the size Telegram shows for it;
     - any failed file shows as `failed!`, not `done!`.
-  - **Record:** whether `Server lost connection state, re-sending initConnection` and `Connection re-initialized` appear. Search `latest.log` and the rotated `.gz` files next to it, with `zgrep` on WSL.
+  - **Record:**
+    - whether `Server lost connection state, re-sending initConnection` and `Connection re-initialized` appear, and whether downloads went on afterwards. Search `latest.log` and the rotated `.gz` files next to it (`zgrep` on WSL);
+    - any failed files.
   - If takeout can't start, the log shows `takeout error` and the downloads go on without takeout.
-- [ ] **Step 4: If it stalls with no output for more than 2 minutes,** rerun with `--debug`. Then attach an excerpt of `latest.log` to abetoots/tdl#1, with dialog IDs, message IDs and usernames redacted. The hang then has another cause: flood wait or connection recovery, candidates 2 and 3 in the issue.
+- [ ] **Step 4: If no file starts and no byte count moves for 2 minutes,** capture what it's doing before stopping it:
+  - **On WSL:** run `kill -QUIT <pid>`. The Go runtime prints every goroutine's stack and exits.
+  - **On Windows:** rerun with `--debug`.
+  - Attach the output or a `latest.log` excerpt to abetoots/tdl#1, with dialog IDs, message IDs and usernames redacted.
 - [ ] **Step 5: Repair the original download directory.**
-  - The old build renamed failed transfers to their final names, and with several threads a failed file can still be full size, with a hole in the middle. `--skip-same` compares only name and size, so it can't spot those.
-  - Delete the files the failed run created, picked by creation time: Windows "Date created", or `stat -c %w` on WSL. Not modification time, which tdl sets to the message date.
-  - Then run `tdl-smoke dl -f <export>.json --takeout -d <original-dir> --restart --skip-same`. It re-downloads what's missing and skips complete files.
+  - The old build renamed failed transfers to their final names. With several threads, a failed file can still be full size, with a hole in it. `--skip-same` compares only name and size, so it can't spot those.
+  - **If Step 3 ran to completion,** the new directory is a clean, complete copy. Use it in place of the original.
+  - **Otherwise,** find the files the failed run created by creation time, not modification time (tdl sets that to the message date).
+    - On Windows: `Get-ChildItem <dir> -Recurse -File | Where-Object CreationTime -ge '<failed run start>'` in PowerShell.
+    - On WSL, `stat -c %w` prints `-` under `/mnt/c`, so use it only for directories inside WSL.
+    - Delete those files, then run `tdl-smoke dl -f <export>.json --takeout -d <original-dir> --restart --skip-same`. It re-downloads them and skips the rest.
+  - `--skip-same` can't match files whose extension an earlier `--rewrite-ext` run changed. The original command didn't use it.
 
 ## Owner decisions (2026-11-26)
 
@@ -302,7 +367,9 @@ This needs the owner's account and can't run here.
 
 - gotd/contrib v0.20.0 → v0.26.0 (needs td ≥ v0.164.0; floodwait gains concurrent dispatch): a separate pull request.
 - CI's unit-test step covers only the root module's packages. `core` and `extension` tests don't run in CI.
-- `core/downloader.Download` returns an iterator error before joining its workers. tdl hides this, because its deferred `prog.Wait` waits for them, except on Ctrl+C. Joining needs cancelled progress bars to close (`app/dl/progress.go:70-75`), or `prog.Wait` hangs.
+- **On Ctrl+C,** `prog.Wait` returns without stopping the renderer. This is cosmetic.
+- **go-pretty ignores `MarkAsErrored` on a bar that's already at 100%.** A close or rename failure after a full transfer still shows `done!`, although the red error line is printed. This is a display issue only.
+- **A successful transfer's byte count isn't checked** against the file size.
 - 32-bit: upstreaming waits for gotd#1985. Other `go.uber.org/atomic.Int64` fields in gotd are unverified.
 - `recovery` retries `context canceled` for up to `--reconnect-timeout`, or forever with `0` (iyear/tdl#854, #865). Needs a redesign.
 - Retest after the bump: iyear/tdl#1071, #900, #876, #385 and #1147. #1363 is fixed by 77cb441.
