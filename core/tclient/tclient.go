@@ -8,7 +8,6 @@ import (
 	"github.com/cenkalti/backoff/v4"
 	"github.com/go-faster/errors"
 	"github.com/gotd/contrib/clock"
-	"github.com/gotd/contrib/middleware/floodwait"
 	tdclock "github.com/gotd/td/clock"
 	"github.com/gotd/td/exchange"
 	"github.com/gotd/td/telegram"
@@ -16,6 +15,7 @@ import (
 	"golang.org/x/net/proxy"
 
 	"github.com/iyear/tdl/core/logctx"
+	"github.com/iyear/tdl/core/middlewares/floodlimit"
 	"github.com/iyear/tdl/core/middlewares/recovery"
 	"github.com/iyear/tdl/core/middlewares/retry"
 	"github.com/iyear/tdl/core/util/netutil"
@@ -41,7 +41,7 @@ type Options struct {
 }
 
 // New creates new telegram client with given options.
-// Default middlewares(retry, recovery, flood wait) always added.
+// default middlewares are always added.
 func New(ctx context.Context, o Options) (*telegram.Client, error) {
 	// process clock
 	tclock := tdclock.System
@@ -89,9 +89,10 @@ func New(ctx context.Context, o Options) (*telegram.Client, error) {
 
 func NewDefaultMiddlewares(ctx context.Context, timeout time.Duration) []telegram.Middleware {
 	return []telegram.Middleware{
+		// keep the flood limit outermost so recovery cannot retry a capped flood wait.
+		floodlimit.New(10),
 		recovery.New(ctx, func() backoff.BackOff { return newBackoff(timeout) }),
 		retry.New(5),
-		floodwait.NewSimpleWaiter(),
 	}
 }
 
