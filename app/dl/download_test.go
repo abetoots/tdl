@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/gotd/td/bin"
 	"github.com/gotd/td/telegram"
@@ -93,7 +94,9 @@ func TestDownloadReportsPostTransferFailure(t *testing.T) {
 			d := downloader.New(downloader.Options{
 				Pool: downloadTestPool{}, Threads: 1, Iter: &singleDownload{elem: elem}, Progress: p,
 			})
-			require.NoError(t, d.Download(t.Context(), 1))
+			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+			defer cancel()
+			require.NoError(t, d.Download(ctx, 1))
 
 			if test.collision {
 				assert.ErrorContains(t, p.err(), "1 file(s) failed after download")
@@ -175,14 +178,15 @@ func TestRunDownloadOutcomes(t *testing.T) {
 		{
 			name:       "iterator cancellation with live run",
 			files:      []string{collision},
-			iterErr:    fmt.Errorf("connection lost: %w", context.Canceled),
-			wantErrors: []string{"iter: connection lost: context canceled", postFailure},
+			iterErr:    fmt.Errorf("resolve message: %w", context.Canceled),
+			wantErrors: []string{"iter: resolve message: context canceled", postFailure},
 			wantLogs:   []string{collision},
 			wantSaved:  `{}`,
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			ctx := t.Context()
+			ctx, cancelTimeout := context.WithTimeout(t.Context(), 5*time.Second)
+			defer cancelTimeout()
 			kvd := resumeTestStorage{resumeKey: []byte(`{"9":{}}`)}
 			dir := t.TempDir()
 			it := &iter{
@@ -224,6 +228,10 @@ func TestRunDownloadOutcomes(t *testing.T) {
 			d := downloader.New(downloader.Options{Pool: pool, Threads: 1, Iter: it, Progress: p})
 			// one worker ensures the rename has finished before the blocked transfer starts
 			err := runDownload(ctx, d, p, 1)
+			if test.iterErr != nil {
+				assert.NotErrorIs(t, err, context.Canceled)
+				assert.ErrorContains(t, err, "connection lost")
+			}
 
 			switch {
 			case test.cancel:

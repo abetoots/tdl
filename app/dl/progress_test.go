@@ -119,6 +119,17 @@ func TestOnDoneSuccessClosesBar(t *testing.T) {
 	assert.NoFileExists(t, elem.to.Name())
 }
 
+func TestOnDoneIgnoresDuplicate(t *testing.T) {
+	w := &logWriter{Writer: pw.NewWriter()}
+	p, _, elem, tracker := setupProgressTest(t, w)
+	p.OnDone(elem, nil)
+	p.OnDone(elem, nil)
+
+	assert.NoError(t, p.err())
+	assert.False(t, tracker.IsErrored())
+	assert.Empty(t, w.lines)
+}
+
 func TestOnDownloadUnknownSize(t *testing.T) {
 	p, _, elem, tracker := setupProgressTest(t, pw.NewWriter())
 	p.OnDownload(elem, downloader.ProgressState{Downloaded: 5, Total: 0})

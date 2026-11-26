@@ -144,7 +144,12 @@ func runDownload(ctx context.Context, d *downloader.Downloader, p *progress, lim
 	if ctxErr := ctx.Err(); ctxErr != nil {
 		return ctxErr
 	}
-	return multierr.Combine(err, p.err())
+	err = multierr.Combine(err, p.err())
+	// gotd's Client.Run exits 0 on any error matching context.Canceled
+	if errors.Is(err, context.Canceled) {
+		return errors.Errorf("connection lost: %v", err)
+	}
+	return err
 }
 
 func finishResume(ctx context.Context, kvd storage.Storage, it *iter, rerr error) error {

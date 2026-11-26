@@ -66,7 +66,7 @@ func (p *progress) OnDownload(elem downloader.Elem, state downloader.ProgressSta
 func (p *progress) OnDone(elem downloader.Elem, err error) {
 	e := elem.(*iterElem)
 
-	tracker, ok := p.trackers.Load(e.id)
+	tracker, ok := p.trackers.LoadAndDelete(e.id)
 	if !ok {
 		return
 	}
