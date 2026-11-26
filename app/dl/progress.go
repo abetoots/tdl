@@ -68,18 +68,23 @@ func (p *progress) OnDone(elem downloader.Elem, err error) {
 	}
 
 	if err != nil {
-		if !errors.Is(err, context.Canceled) { // don't report user cancel
+		if errors.Is(err, context.Canceled) {
+			t.MarkAsErrored()
+		} else {
 			p.fail(t, elem, errors.Wrap(err, "progress"))
 		}
 		_ = os.Remove(e.to.Name()) // just try to remove temp file, ignore error
 		return
 	}
 
-	p.it.Finish(e.logicalPos)
-
 	if err := p.donePost(e); err != nil {
 		p.fail(t, elem, errors.Wrap(err, "post file"))
 		return
+	}
+
+	p.it.Finish(e.logicalPos)
+	if !t.IsDone() {
+		t.MarkAsDone()
 	}
 }
 
