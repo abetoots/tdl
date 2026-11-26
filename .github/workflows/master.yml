@@ -49,7 +49,7 @@ jobs:
       - name: Build
         run: go build
       - name: Unit Test
-        run: go test -race -timeout 5m -v $(go list ./... ./core/... ./extension/... | grep -vE '/test(/|$)')
+        run: go test -race -timeout 5m -v $(go list ./... ./core/... ./extension/... | grep -vE '/test(/|$)') # skip e2e test
   e2e-test:
     runs-on: ubuntu-22.04
     if: false # skip e2e test for now, since it is not stable

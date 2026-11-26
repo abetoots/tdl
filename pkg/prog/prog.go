@@ -42,15 +42,16 @@ func New(formatter progress.UnitsFormatter) progress.Writer {
 }
 
 func Wait(ctx context.Context, pw progress.Writer) {
-	stopped := false
+	var lastStop time.Time
 	for pw.IsRenderInProgress() {
 		select {
 		case <-ctx.Done():
 			return
 		default:
-			if !stopped && pw.LengthActive() == 0 {
-				pw.Stop()
-				stopped = true
+			if time.Since(lastStop) >= time.Second && pw.LengthActive() == 0 {
+				// go-pretty can block stop before its render loop creates the stop channel
+				go pw.Stop()
+				lastStop = time.Now()
 			}
 			time.Sleep(10 * time.Millisecond)
 		}

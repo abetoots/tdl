@@ -2,9 +2,11 @@ package dcpool
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"time"
 
+	"github.com/gotd/td/bin"
 	"github.com/gotd/td/telegram"
 	"github.com/gotd/td/tg"
 	"github.com/gotd/td/tgerr"
@@ -16,6 +18,14 @@ import (
 )
 
 var testMode = false
+
+var errPoolClosed = errors.New("dcpool: pool closed")
+
+type closedInvoker struct{}
+
+func (closedInvoker) Invoke(context.Context, bin.Encoder, bin.Decoder) error {
+	return errPoolClosed
+}
 
 // EnableTestMode enables test mode, which disables takeout and pooling and directly returns original client.
 func EnableTestMode() {
@@ -46,6 +56,7 @@ type pool struct {
 	closes        map[int]func() error
 	takeout       int64
 	takeoutFailed bool
+	closed        bool
 }
 
 func NewPool(c *telegram.Client, size int64, middlewares ...telegram.Middleware) Pool {
@@ -76,6 +87,10 @@ func (p *pool) Client(ctx context.Context, dc int) *tg.Client {
 }
 
 func (p *pool) invoker(ctx context.Context, dc int) tg.Invoker {
+	if p.closed {
+		return closedInvoker{}
+	}
+
 	// self-hosted Telegram server can't properly handle pooling connections,
 	// so directly return original client
 	if testMode {
@@ -114,14 +129,20 @@ func (p *pool) Default(ctx context.Context) *tg.Client {
 
 func (p *pool) Close() (err error) {
 	p.mu.Lock()
+	if p.closed {
+		p.mu.Unlock()
+		return nil
+	}
 	id := p.takeout
 	var finishInvoker tg.Invoker
 	if id != 0 {
 		finishInvoker = chainMiddlewares(p.invoker(context.Background(), p.current()), takeout.Middleware(id))
 	}
 	closes := p.closes
+	p.closed = true
 	p.takeout = 0
-	p.closes = make(map[int]func() error)
+	p.closes = nil
+	p.invokers = nil
 	p.mu.Unlock()
 
 	if id != 0 {
@@ -141,8 +162,10 @@ func (p *pool) Takeout(ctx context.Context, dc int) *tg.Client {
 	defer p.mu.Unlock()
 
 	// lazy init
-	if p.takeout == 0 && !p.takeoutFailed {
-		sid, err := takeout.Takeout(ctx, p.api)
+	if !p.closed && p.takeout == 0 && !p.takeoutFailed {
+		initCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		sid, err := takeout.Takeout(initCtx, p.api)
+		cancel()
 		if err != nil {
 			if _, ok := tgerr.As(err); ok {
 				p.takeoutFailed = true
