@@ -19,6 +19,12 @@ func NewPeers(kv Storage) peers.Storage {
 	return &Peers{kv: kv}
 }
 
+// PeerOptions returns peers options backed by kv. gotd's in-memory peer cache is off:
+// it shares mutable objects across goroutines, and v0.140 didn't cache.
+func PeerOptions(kv Storage) peers.Options {
+	return peers.Options{Storage: NewPeers(kv), Cache: peers.NoopCache{}}
+}
+
 func (p *Peers) Save(ctx context.Context, key peers.Key, value peers.Value) error {
 	bytes, err := json.Marshal(value)
 	if err != nil {

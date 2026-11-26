@@ -3,7 +3,6 @@ package tmessage
 import (
 	"context"
 
-	"github.com/gotd/td/telegram/peers"
 	"go.uber.org/zap"
 
 	"github.com/iyear/tdl/core/dcpool"
@@ -14,8 +13,7 @@ import (
 
 func FromURL(ctx context.Context, pool dcpool.Pool, kvd storage.Storage, urls []string) ParseSource {
 	return func() ([]*Dialog, error) {
-		manager := peers.Options{Storage: storage.NewPeers(kvd)}.
-			Build(pool.Default(ctx))
+		manager := storage.PeerOptions(kvd).Build(pool.Default(ctx))
 		msgMap := make(map[int64]*Dialog)
 
 		for _, u := range urls {

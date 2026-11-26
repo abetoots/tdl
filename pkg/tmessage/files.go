@@ -156,6 +156,6 @@ func getChatInfo(ctx context.Context, client *tg.Client, kvd storage.Storage, fi
 		return nil, errors.New("can't get chat type or chat id")
 	}
 
-	manager := peers.Options{Storage: storage.NewPeers(kvd)}.Build(client)
+	manager := storage.PeerOptions(kvd).Build(client)
 	return tutil.GetInputPeer(ctx, manager, strconv.FormatInt(chatID, 10))
 }

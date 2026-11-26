@@ -16,7 +16,6 @@ import (
 	"github.com/gotd/contrib/http_io"
 	"github.com/gotd/contrib/partio"
 	"github.com/gotd/contrib/tg_io"
-	"github.com/gotd/td/telegram/peers"
 	"github.com/gotd/td/tg"
 	"github.com/spf13/viper"
 
@@ -44,7 +43,7 @@ func serve(ctx context.Context,
 	port int,
 	takeout bool,
 ) error {
-	manager := peers.Options{Storage: storage.NewPeers(kvd)}.Build(pool.Default(ctx))
+	manager := storage.PeerOptions(kvd).Build(pool.Default(ctx))
 
 	router := mux.NewRouter()
 

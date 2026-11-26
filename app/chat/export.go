@@ -76,7 +76,7 @@ func Export(ctx context.Context, c *telegram.Client, kvd storage.Storage, opts E
 
 	var peer peers.Peer
 
-	manager := peers.Options{Storage: storage.NewPeers(kvd)}.Build(c.API())
+	manager := storage.PeerOptions(kvd).Build(c.API())
 	if opts.Chat == "" { // defaults to me(saved messages)
 		peer, err = manager.Self(ctx)
 	} else {
