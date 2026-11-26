@@ -47,11 +47,20 @@ func setupProgressTest(t *testing.T, w pw.Writer) (*progress, *iter, *iterElem, 
 	t.Helper()
 	it := &iter{mu: &sync.Mutex{}, finished: map[int]struct{}{}}
 	p := newProgress(w, it, Options{})
+	elem := newProgressTestElem(t)
+	p.OnAdd(elem)
+	tracker, ok := p.trackers.Load(elem.id)
+	require.True(t, ok)
+	return p, it, elem, tracker.(*pw.Tracker)
+}
+
+func newProgressTestElem(t *testing.T) *iterElem {
+	t.Helper()
 	to, err := os.Create(filepath.Join(t.TempDir(), "a.bin.tmp"))
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = to.Close() })
 
-	elem := &iterElem{
+	return &iterElem{
 		id:         1,
 		logicalPos: 7,
 		to:         to,
@@ -59,10 +68,6 @@ func setupProgressTest(t *testing.T, w pw.Writer) (*progress, *iter, *iterElem, 
 		fromMsg:    &tg.Message{ID: 1},
 		from:       fakePeer{},
 	}
-	p.OnAdd(elem)
-	tracker, ok := p.trackers.Load(1)
-	require.True(t, ok)
-	return p, it, elem, tracker.(*pw.Tracker)
 }
 
 func TestOnDoneClosesBarOnError(t *testing.T) {
@@ -102,6 +107,8 @@ func TestOnDoneSuccessClosesBar(t *testing.T) {
 
 	assert.True(t, tracker.IsDone(), "tracker should be done")
 	assert.False(t, tracker.IsErrored(), "tracker should not be errored")
+	assert.Equal(t, elem.file.Size, tracker.Value())
+	assert.Equal(t, elem.file.Size, tracker.Total)
 	assert.Contains(t, it.Finished(), 7)
 	st, err := os.Stat(filepath.Join(filepath.Dir(elem.to.Name()), "a.bin"))
 	require.NoError(t, err)
@@ -109,13 +116,34 @@ func TestOnDoneSuccessClosesBar(t *testing.T) {
 	assert.NoFileExists(t, elem.to.Name())
 }
 
-func TestOnDoneFailureClosesFullBar(t *testing.T) {
+func TestOnDownloadUnknownSize(t *testing.T) {
 	p, _, elem, tracker := setupProgressTest(t, pw.NewWriter())
+	p.OnDownload(elem, downloader.ProgressState{Downloaded: 5, Total: 0})
+
+	assert.EqualValues(t, 5, tracker.Value())
+	assert.False(t, tracker.IsDone())
+}
+
+func TestOnDoneSuccessUsesDownloadedBytes(t *testing.T) {
+	p, _, elem, tracker := setupProgressTest(t, pw.NewWriter())
+	p.OnDownload(elem, downloader.ProgressState{Downloaded: 5, Total: elem.file.Size})
+	p.OnDone(elem, nil)
+
+	assert.True(t, tracker.IsDone())
+	assert.EqualValues(t, 5, tracker.Value())
+	assert.EqualValues(t, 5, tracker.Total)
+}
+
+func TestOnDoneFailureAfterAllBytesStillErrors(t *testing.T) {
+	p, it, elem, tracker := setupProgressTest(t, pw.NewWriter())
 	p.OnDownload(elem, downloader.ProgressState{Downloaded: elem.file.Size, Total: elem.file.Size})
 	p.OnDone(elem, errors.New("boom"))
 
 	assert.True(t, tracker.IsDone())
 	assert.True(t, tracker.IsErrored())
+	assert.NotContains(t, it.Finished(), 7)
+	assert.NoFileExists(t, elem.to.Name())
+	assert.Zero(t, p.failed.Load())
 }
 
 func TestOnDoneRenameFailureNotFinished(t *testing.T) {
@@ -128,17 +156,25 @@ func TestOnDoneRenameFailureNotFinished(t *testing.T) {
 	assert.True(t, tracker.IsErrored())
 	assert.NotContains(t, it.Finished(), 7)
 	assert.FileExists(t, elem.to.Name())
+	assert.EqualValues(t, 1, p.failed.Load())
 	require.Len(t, w.lines, 1)
 	assert.Contains(t, w.lines[0], "rename file")
 }
 
 func TestOnDoneCloseError(t *testing.T) {
-	for _, transferErr := range []error{nil, io.ErrUnexpectedEOF} {
-		t.Run(fmt.Sprint(transferErr), func(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		err  error
+	}{
+		{name: "close only"},
+		{name: "transfer and close", err: io.ErrUnexpectedEOF},
+		{name: "cancel and close", err: fmt.Errorf("download interrupted: %w", context.Canceled)},
+	} {
+		t.Run(test.name, func(t *testing.T) {
 			w := &logWriter{Writer: pw.NewWriter()}
 			p, it, elem, tracker := setupProgressTest(t, w)
 			require.NoError(t, elem.to.Close())
-			p.OnDone(elem, transferErr)
+			p.OnDone(elem, test.err)
 
 			assert.True(t, tracker.IsErrored())
 			assert.NotContains(t, it.Finished(), 7)
@@ -146,11 +182,38 @@ func TestOnDoneCloseError(t *testing.T) {
 			assert.NoFileExists(t, elem.to.Name())
 			require.Len(t, w.lines, 1)
 			assert.Contains(t, w.lines[0], "close file")
-			if transferErr != nil {
-				assert.Contains(t, w.lines[0], transferErr.Error())
+			switch test.err {
+			case nil:
+				assert.EqualValues(t, 1, p.failed.Load())
+			case io.ErrUnexpectedEOF:
+				assert.Contains(t, w.lines[0], test.err.Error())
+				assert.Zero(t, p.failed.Load())
+			default:
+				assert.Contains(t, w.lines[0], "error: close file")
+				assert.NotContains(t, w.lines[0], test.err.Error())
+				assert.NotContains(t, w.lines[0], context.Canceled.Error())
+				assert.Zero(t, p.failed.Load())
 			}
 		})
 	}
+}
+
+func TestOnDoneChtimesFailureStillFinishes(t *testing.T) {
+	original := chtimes
+	t.Cleanup(func() { chtimes = original })
+	chtimes = func(string, time.Time, time.Time) error { return errors.New("timestamps unavailable") }
+
+	w := &logWriter{Writer: pw.NewWriter()}
+	p, it, elem, tracker := setupProgressTest(t, w)
+	elem.file.Date = 1_700_000_000
+	p.OnDone(elem, nil)
+
+	assert.True(t, tracker.IsDone())
+	assert.False(t, tracker.IsErrored())
+	assert.Contains(t, it.Finished(), 7)
+	assert.NoError(t, p.err())
+	require.Len(t, w.lines, 1)
+	assert.Contains(t, w.lines[0], "set file time")
 }
 
 func TestOnDoneCancelLetsProgressWaitReturn(t *testing.T) {

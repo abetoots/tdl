@@ -3,9 +3,11 @@ package dcpool
 import (
 	"context"
 	"sync"
+	"time"
 
 	"github.com/gotd/td/telegram"
 	"github.com/gotd/td/tg"
+	"github.com/gotd/td/tgerr"
 	"go.uber.org/multierr"
 	"go.uber.org/zap"
 
@@ -111,21 +113,21 @@ func (p *pool) Default(ctx context.Context) *tg.Client {
 }
 
 func (p *pool) Close() (err error) {
-	ctx := context.TODO()
 	p.mu.Lock()
 	id := p.takeout
 	var finishInvoker tg.Invoker
 	if id != 0 {
-		finishInvoker = chainMiddlewares(p.invoker(ctx, p.current()), takeout.Middleware(id))
+		finishInvoker = chainMiddlewares(p.invoker(context.Background(), p.current()), takeout.Middleware(id))
 	}
-	closes := make([]func() error, 0, len(p.closes))
-	for _, c := range p.closes {
-		closes = append(closes, c)
-	}
+	closes := p.closes
+	p.takeout = 0
+	p.closes = make(map[int]func() error)
 	p.mu.Unlock()
 
 	if id != 0 {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		err = takeout.UnTakeout(ctx, finishInvoker)
+		cancel()
 	}
 	for _, c := range closes {
 		err = multierr.Append(err, c())
@@ -142,7 +144,9 @@ func (p *pool) Takeout(ctx context.Context, dc int) *tg.Client {
 	if p.takeout == 0 && !p.takeoutFailed {
 		sid, err := takeout.Takeout(ctx, p.api)
 		if err != nil {
-			p.takeoutFailed = true
+			if _, ok := tgerr.As(err); ok {
+				p.takeoutFailed = true
+			}
 			logctx.From(ctx).Warn("takeout error", zap.Error(err))
 		} else {
 			p.takeout = sid
