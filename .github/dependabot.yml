@@ -19,6 +19,7 @@ updates:
       # gotd/td is pinned by hand: core/storage strips stored dc keys and turns off the
       # peers cache to match v0.166.1's internals; recheck both before bumping
       - dependency-name: "github.com/gotd/td"
+      - dependency-name: "github.com/gotd/contrib" # contrib bumps can raise gotd/td through minimum version selection
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
