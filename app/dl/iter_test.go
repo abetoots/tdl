@@ -213,19 +213,10 @@ func BenchmarkDeletedMessageDetection(b *testing.B) {
 // context cancellation even during deleted message handling
 func TestIterContextCancellation(t *testing.T) {
 	t.Run("context cancellation during deleted message handling", func(t *testing.T) {
-		ctx, cancel := context.WithTimeout(context.Background(), 1*time.Millisecond)
+		ctx, cancel := context.WithTimeout(t.Context(), time.Millisecond)
 		defer cancel()
 
-		// Wait for context to be cancelled
-		time.Sleep(5 * time.Millisecond)
-
-		// Verify that the context is cancelled
-		select {
-		case <-ctx.Done():
-			assert.NotNil(t, ctx.Err(),
-				"Context should be cancelled")
-		default:
-			t.Fatal("Context should be cancelled")
-		}
+		<-ctx.Done()
+		assert.ErrorIs(t, ctx.Err(), context.DeadlineExceeded)
 	})
 }
