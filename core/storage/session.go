@@ -2,6 +2,7 @@ package storage
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 
 	"github.com/gotd/td/telegram"
@@ -30,7 +31,33 @@ func (s *Session) LoadSession(ctx context.Context) ([]byte, error) {
 		}
 		return nil, err
 	}
-	return b, nil
+	var envelope map[string]json.RawMessage
+	if err := json.Unmarshal(b, &envelope); err != nil {
+		return b, nil
+	}
+	var version int
+	if err := json.Unmarshal(envelope["Version"], &version); err != nil || version != 1 {
+		return b, nil
+	}
+	var data map[string]json.RawMessage
+	if err := json.Unmarshal(envelope["Data"], &data); err != nil {
+		return b, nil
+	}
+	if _, ok := data["DCs"]; !ok {
+		return b, nil
+	}
+
+	// gotd v0.166+ stores other DCs' keys as authorized; tdl's dcpool can't recover a revoked one, so drop them and transfer each run (as v0.140 did)
+	delete(data, "DCs")
+	envelope["Data"], err = json.Marshal(data)
+	if err != nil {
+		return b, nil
+	}
+	filtered, err := json.Marshal(envelope)
+	if err != nil {
+		return b, nil
+	}
+	return filtered, nil
 }
 
 func (s *Session) StoreSession(ctx context.Context, data []byte) error {
