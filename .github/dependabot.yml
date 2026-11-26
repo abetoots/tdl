@@ -15,6 +15,10 @@ updates:
     assignees:
       - "iyear"
     open-pull-requests-limit: 99
+    ignore:
+      # gotd/td is pinned by hand: core/storage strips stored dc keys and turns off the
+      # peers cache to match v0.166.1's internals; recheck both before bumping
+      - dependency-name: "github.com/gotd/td"
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
