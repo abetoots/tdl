@@ -86,14 +86,7 @@ func New(o Options) func(h Handler) {
 		defer cancel()
 
 		assert(tclient.RunWithAuth(ctx, client, func(ctx context.Context) error {
-			if err := h(ctx, ext); err != nil {
-				if errors.Is(err, context.Canceled) {
-					return nil
-				}
-				return err
-			}
-
-			return nil
+			return h(ctx, ext)
 		}))
 	}
 }
@@ -150,16 +143,21 @@ func buildClient(ctx context.Context, env *Env, o Options) (*telegram.Client, er
 		return nil, errors.Wrap(err, "store session")
 	}
 
-	return tclient.New(ctx, tclient.Options{
+	opts := clientOptions(env, o)
+	opts.Session = storage
+	return tclient.New(ctx, opts)
+}
+
+func clientOptions(env *Env, o Options) tclient.Options {
+	return tclient.Options{
 		AppID:            env.AppID,
 		AppHash:          env.AppHash,
-		Session:          storage,
 		Middlewares:      o.Middlewares,
 		Proxy:            env.Proxy,
 		NTP:              env.NTP,
 		ReconnectTimeout: 0, // no timeout
 		UpdateHandler:    o.UpdateHandler,
-	})
+	}
 }
 
 func assert(err error) {

@@ -33,8 +33,16 @@ func (fakePeer) VisibleName() string { return "test peer" }
 
 type logWriter struct {
 	pw.Writer
-	mu    sync.Mutex
-	lines []string
+	mu       sync.Mutex
+	lines    []string
+	trackers []*pw.Tracker
+}
+
+func (w *logWriter) AppendTracker(tracker *pw.Tracker) {
+	w.mu.Lock()
+	w.trackers = append(w.trackers, tracker)
+	w.mu.Unlock()
+	w.Writer.AppendTracker(tracker)
 }
 
 func (w *logWriter) Log(msg string, args ...any) {
@@ -166,13 +174,15 @@ func TestOnDoneSuccessWithOneByte(t *testing.T) {
 }
 
 func TestOnDoneSuccessUsesDownloadedBytes(t *testing.T) {
-	p, _, elem, tracker := setupProgressTest(t, pw.NewWriter())
+	p, it, elem, tracker := setupProgressTest(t, pw.NewWriter())
 	p.OnDownload(elem, downloader.ProgressState{Downloaded: 5, Total: elem.file.Size})
 	p.OnDone(elem, nil)
 
 	assert.True(t, tracker.IsDone())
 	assert.EqualValues(t, 5, tracker.Value())
 	assert.EqualValues(t, 5, tracker.Total)
+	assert.Contains(t, it.Finished(), elem.logicalPos)
+	assert.FileExists(t, filepath.Join(filepath.Dir(elem.to.Name()), elem.file.Name))
 }
 
 func TestOnDoneFailureAfterAllBytesStillErrors(t *testing.T) {

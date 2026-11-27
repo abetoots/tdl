@@ -137,6 +137,18 @@ func TestFloodLimitWaitDuration(t *testing.T) {
 	}
 }
 
+func TestFloodLimitSuccessAsContextEnds(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	next := telegram.InvokeFunc(func(context.Context, bin.Encoder, bin.Decoder) error {
+		cancel()
+		return nil
+	})
+	if err := New(10).Handle(next)(ctx, &tg.UploadGetFileRequest{}, &tg.UploadFileBox{}); err != nil {
+		t.Errorf("Invoke error = %v, want nil after a successful call", err)
+	}
+}
+
 func TestFloodLimitStopsWaitingAtDeadline(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		ctx, cancel := context.WithTimeout(t.Context(), time.Second)

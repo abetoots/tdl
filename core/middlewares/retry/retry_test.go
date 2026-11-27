@@ -127,6 +127,18 @@ func TestRetrySucceedsOnThirdAttempt(t *testing.T) {
 	})
 }
 
+func TestRetrySuccessAsContextEnds(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	next := telegram.InvokeFunc(func(context.Context, bin.Encoder, bin.Decoder) error {
+		cancel()
+		return nil
+	})
+	if err := New(5).Handle(next)(ctx, &tg.UploadGetFileRequest{}, &tg.UploadFileBox{}); err != nil {
+		t.Errorf("Invoke error = %v, want nil after a successful call", err)
+	}
+}
+
 func TestRetryWithZeroAttemptsStillInvokesNext(t *testing.T) {
 	calls := 0
 	next := telegram.InvokeFunc(func(context.Context, bin.Encoder, bin.Decoder) error {

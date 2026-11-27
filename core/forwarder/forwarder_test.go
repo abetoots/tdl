@@ -40,13 +40,14 @@ type forwardTestElem struct {
 	from, to peers.Peer
 	msg      *tg.Message
 	grouped  bool
+	mode     Mode
 }
 
 func (e forwardTestElem) From() peers.Peer { return e.from }
 func (e forwardTestElem) To() peers.Peer   { return e.to }
 func (e forwardTestElem) Msg() *tg.Message { return e.msg }
 func (e forwardTestElem) AsGrouped() bool  { return e.grouped }
-func (forwardTestElem) Mode() Mode         { return ModeDirect }
+func (e forwardTestElem) Mode() Mode       { return e.mode }
 func (forwardTestElem) Thread() int        { return 0 }
 func (forwardTestElem) AsSilent() bool     { return false }
 func (forwardTestElem) AsDryRun() bool     { return false }
@@ -67,29 +68,37 @@ func (p *forwardTestProgress) OnDone(e Elem, err error) {
 
 func (*forwardTestProgress) OnClone(Elem, ProgressState) {}
 
-func TestForwardGroupedLookupFailure(t *testing.T) {
+func TestForwardMessageFailure(t *testing.T) {
 	for _, tt := range []struct {
 		name     string
 		canceled bool
+		grouped  bool
+		failure  error
 	}{
-		{name: "reports failure and forwards next element"},
-		{name: "stops on caller cancellation", canceled: true},
+		{name: "album lookup failure", grouped: true, failure: errors.New("album history unavailable")},
+		{name: "album connection lost", grouped: true, failure: fmt.Errorf("album history RPC: %w", context.Canceled)},
+		{name: "album canceled by caller", grouped: true, canceled: true, failure: context.Canceled},
+		{name: "single message connection lost", failure: fmt.Errorf("send message RPC: %w", context.Canceled)},
+		{name: "single message canceled by caller", canceled: true, failure: context.Canceled},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			ctx, cancel := context.WithCancel(t.Context())
 			defer cancel()
-			lookupErr := errors.New("album history unavailable")
-			calls := 0
+			failures := 0
+			fail := func() error {
+				failures++
+				if tt.canceled {
+					cancel()
+				}
+				return tt.failure
+			}
 			var forwarded []int
-			next := telegram.InvokeFunc(func(ctx context.Context, input bin.Encoder, _ bin.Decoder) error {
+			next := telegram.InvokeFunc(func(_ context.Context, input bin.Encoder, _ bin.Decoder) error {
 				switch req := input.(type) {
 				case *tg.MessagesGetHistoryRequest:
-					calls++
-					if tt.canceled {
-						cancel()
-						return ctx.Err()
-					}
-					return lookupErr
+					return fail()
+				case *tg.MessagesSendMessageRequest:
+					return fail()
 				case *tg.MessagesForwardMessagesRequest:
 					forwarded = append(forwarded, req.ID...)
 					return nil
@@ -100,17 +109,22 @@ func TestForwardGroupedLookupFailure(t *testing.T) {
 			client := tg.NewClient(next)
 			manager := (peers.Options{}).Build(client)
 			from, to := manager.User(&tg.User{ID: 1}), manager.User(&tg.User{ID: 2})
-			grouped := &tg.Message{ID: 100}
-			grouped.SetGroupedID(10)
+			first := forwardTestElem{from: from, to: to, msg: &tg.Message{ID: 100, Message: "first"}}
+			if tt.grouped {
+				first.grouped = true
+				first.msg.SetGroupedID(10)
+			} else {
+				first.mode = ModeClone
+			}
 			second := &tg.Message{ID: 101}
 			it := &forwardTestIter{elems: []Elem{
-				forwardTestElem{from: from, to: to, msg: grouped, grouped: true},
+				first,
 				forwardTestElem{from: from, to: to, msg: second},
 			}}
 			progress := &forwardTestProgress{errors: make(map[int]error)}
 			err := New(Options{Pool: forwardTestPool{client: client}, Iter: it, Progress: progress}).Forward(ctx)
-			if calls != 1 {
-				t.Errorf("history calls = %d, want 1", calls)
+			if failures != 1 {
+				t.Errorf("failed requests = %d, want 1", failures)
 			}
 			if tt.canceled {
 				if !errors.Is(err, context.Canceled) || len(forwarded) != 0 {
@@ -124,9 +138,9 @@ func TestForwardGroupedLookupFailure(t *testing.T) {
 			if want := []string{"add 100", "done 100", "add 101", "done 101"}; !slices.Equal(progress.events, want) {
 				t.Errorf("progress events = %v, want %v", progress.events, want)
 			}
-			if err := progress.errors[grouped.ID]; !errors.Is(err, lookupErr) ||
-				!strings.Contains(err.Error(), "resolve grouped message") || !strings.Contains(err.Error(), lookupErr.Error()) {
-				t.Errorf("album progress error = %v, want grouped lookup error", err)
+			if err := progress.errors[first.msg.ID]; !errors.Is(err, tt.failure) || !strings.Contains(err.Error(), tt.failure.Error()) ||
+				tt.grouped && !strings.Contains(err.Error(), "resolve grouped message") {
+				t.Errorf("progress error = %v, want context and text for %v", err, tt.failure)
 			}
 			if !slices.Equal(forwarded, []int{second.ID}) || progress.errors[second.ID] != nil {
 				t.Errorf("forwarded %v with error %v, want successful message %d", forwarded, progress.errors[second.ID], second.ID)

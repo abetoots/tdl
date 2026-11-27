@@ -52,14 +52,14 @@ func (r retry) Handle(next tg.Invoker) telegram.InvokeFunc {
 			}
 
 			err := next.Invoke(ctx, input, output)
+			if err == nil {
+				return nil
+			}
 			if ctxErr := ctx.Err(); ctxErr != nil {
 				if _, ok := tgerr.As(err); ok {
 					lastErr = err
 				}
 				return WaitContextError(ctxErr, lastErr)
-			}
-			if err == nil {
-				return nil
 			}
 			if !tgerr.Is(err, r.errors...) {
 				return errors.Wrap(err, "retry middleware skip")
