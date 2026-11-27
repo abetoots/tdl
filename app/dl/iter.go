@@ -43,6 +43,15 @@ type fileTemplate struct {
 	FileCaption  string
 	FileSize     string
 	DownloadDate int64
+
+	lookupTopicTitle func() (string, error)
+}
+
+func (f *fileTemplate) TopicTitle() (string, error) {
+	if f.TopicID == 0 {
+		return "", nil
+	}
+	return f.lookupTopicTitle()
 }
 
 type iter struct {
@@ -54,6 +63,8 @@ type iter struct {
 	exclude map[string]struct{}
 	opts    Options
 	delay   time.Duration
+
+	topicTitles map[int64]map[int]string
 
 	mu          *sync.Mutex
 	finished    map[int]struct{}
@@ -104,6 +115,8 @@ func newIter(pool dcpool.Pool, manager *peers.Manager, dialog [][]*tmessage.Dial
 		exclude: excludeMap,
 		tpl:     tpl,
 		delay:   delay,
+
+		topicTitles: make(map[int64]map[int]string),
 
 		mu:          &sync.Mutex{},
 		finished:    make(map[int]struct{}),
@@ -236,6 +249,30 @@ func messageTopicID(message *tg.Message, from peers.Peer) int {
 	return 0
 }
 
+func (i *iter) topicTitle(ctx context.Context, from peers.Peer, topicID int) (string, error) {
+	dialogID := from.ID()
+	titles, ok := i.topicTitles[dialogID]
+	if !ok {
+		topics, err := tutil.GetForumTopics(ctx, i.pool.Default(ctx), from.InputPeer())
+		if err != nil {
+			return "", err
+		}
+		titles = make(map[int]string, len(topics))
+		for _, topic := range topics {
+			titles[topic.ID] = topic.Title
+		}
+		i.topicTitles[dialogID] = titles
+	}
+
+	if title, ok := titles[topicID]; ok {
+		return title, nil
+	}
+	if topicID == 1 {
+		return "General", nil
+	}
+	return fmt.Sprintf("topic %d", topicID), nil
+}
+
 func (i *iter) processSingle(ctx context.Context, message *tg.Message, from peers.Peer, logicalPos int) (bool, bool) {
 	item, ok := tmedia.GetMedia(message)
 	if !ok {
@@ -256,16 +293,20 @@ func (i *iter) processSingle(ctx context.Context, message *tg.Message, from peer
 		return false, true
 	}
 
+	topicID := messageTopicID(message, from)
 	toName := bytes.Buffer{}
 	err := i.tpl.Execute(&toName, &fileTemplate{
 		DialogID:     from.ID(),
-		TopicID:      messageTopicID(message, from),
+		TopicID:      topicID,
 		MessageID:    message.ID,
 		MessageDate:  int64(message.Date),
 		FileName:     item.Name,
 		FileCaption:  message.Message,
 		FileSize:     utils.Byte.FormatBinaryBytes(item.Size),
 		DownloadDate: time.Now().Unix(),
+		lookupTopicTitle: func() (string, error) {
+			return i.topicTitle(ctx, from, topicID)
+		},
 	})
 	if err != nil {
 		i.err = errors.Wrap(err, "execute template")

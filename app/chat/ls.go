@@ -9,7 +9,6 @@ import (
 
 	"github.com/expr-lang/expr"
 	"github.com/fatih/color"
-	"github.com/go-faster/errors"
 	"github.com/gotd/td/telegram"
 	"github.com/gotd/td/telegram/message/peer"
 	"github.com/gotd/td/telegram/peers"
@@ -232,7 +231,7 @@ func processChannel(ctx context.Context, api *tg.Client, id int64, entities peer
 	}
 
 	if c.Forum {
-		topics, err := fetchTopics(ctx, api, c.AsInputPeer())
+		topics, err := tutil.GetForumTopics(ctx, api, c.AsInputPeer())
 		if err != nil {
 			logctx.From(ctx).Error("failed to fetch topics",
 				zap.Int64("channel_id", c.ID),
@@ -241,95 +240,13 @@ func processChannel(ctx context.Context, api *tg.Client, id int64, entities peer
 			return nil
 		}
 
-		d.Topics = topics
+		d.Topics = make([]Topic, len(topics))
+		for index, topic := range topics {
+			d.Topics[index] = Topic(topic)
+		}
 	}
 
 	return d
-}
-
-// fetchTopics https://github.com/telegramdesktop/tdesktop/blob/4047f1733decd5edf96d125589f128758b68d922/Telegram/SourceFiles/data/data_forum.cpp#L135
-func fetchTopics(ctx context.Context, api *tg.Client, peer tg.InputPeerClass) ([]Topic, error) {
-	log := logctx.From(ctx)
-	res := make([]Topic, 0)
-	limit := 100 // why can't we use 500 like tdesktop?
-	offsetTopic, offsetID, offsetDate := 0, 0, 0
-	lastOffsetTopic := -1 // Track the last offsetTopic to detect infinite loops
-
-	// Track seen offsetTopics to detect cycles
-	seenOffsets := make(map[int]bool)
-
-	for {
-		// Detect infinite loop: if offsetTopic hasn't changed or we've seen it before
-		if offsetTopic == lastOffsetTopic && lastOffsetTopic != -1 {
-			log.Warn("pagination stuck (same offset), breaking loop",
-				zap.Int("offset_topic", offsetTopic))
-			break
-		}
-		if seenOffsets[offsetTopic] {
-			log.Warn("pagination cycle detected, breaking loop",
-				zap.Int("offset_topic", offsetTopic))
-			break
-		}
-		seenOffsets[offsetTopic] = true
-		lastOffsetTopic = offsetTopic
-
-		req := &tg.MessagesGetForumTopicsRequest{
-			Peer:        peer,
-			Limit:       limit,
-			OffsetTopic: offsetTopic,
-			OffsetID:    offsetID,
-			OffsetDate:  offsetDate,
-		}
-
-		topics, err := api.MessagesGetForumTopics(ctx, req)
-		if err != nil {
-			return nil, errors.Wrap(err, "get forum topics")
-		}
-
-		// If no topics returned, we're done
-		if len(topics.Topics) == 0 {
-			break
-		}
-
-		for _, tp := range topics.Topics {
-			if t, ok := tp.(*tg.ForumTopic); ok {
-				res = append(res, Topic{
-					ID:    t.ID,
-					Title: t.Title,
-				})
-
-				offsetTopic = t.ID
-			}
-		}
-
-		// Safety break if we've collected all topics
-		if len(res) >= topics.Count {
-			break
-		}
-
-		// last page
-		if len(topics.Topics) < limit {
-			break
-		}
-
-		// Update offset using last message if available
-		// Use a local variable for length to be absolutely safe against index out of range
-		msgCount := len(topics.Messages)
-		if msgCount > 0 {
-			if lastMsg, ok := topics.Messages[msgCount-1].AsNotEmpty(); ok {
-				offsetID, offsetDate = lastMsg.GetID(), lastMsg.GetDate()
-			} else {
-				log.Debug("no valid message for offset, relying on offsetTopic only",
-					zap.Int("offset_topic", offsetTopic))
-			}
-		} else {
-			log.Debug("no messages in topics response, relying on offsetTopic only",
-				zap.Int("offset_topic", offsetTopic),
-				zap.Int("topics_count", len(topics.Topics)))
-		}
-	}
-
-	return res, nil
 }
 
 func processChat(id int64, entities peer.Entities) *Dialog {
