@@ -150,7 +150,7 @@ func TestRunDownloadOutcomes(t *testing.T) {
 		invokers   map[int]tg.Invoker
 		iterErr    error
 		cancel     bool
-		flood      bool
+		refusal    *tgerr.Error
 		wantErrors []string
 		wantLogs   []string
 		wantSaved  string
@@ -170,9 +170,17 @@ func TestRunDownloadOutcomes(t *testing.T) {
 		{
 			name:       "chunk flood cap",
 			files:      []string{"flood.bin", "sibling.bin"},
-			flood:      true,
+			refusal:    tgerr.New(420, "FLOOD_WAIT_5"),
 			wantErrors: []string{"1 file(s) failed to download"},
 			wantLogs:   []string{"flood.bin"},
+			wantSaved:  `{"1":{}}`,
+		},
+		{
+			name:       "chunk RPC failure",
+			files:      []string{"rpc.bin", "sibling.bin"},
+			refusal:    tgerr.New(500, "RPC_CALL_FAIL"),
+			wantErrors: []string{"1 file(s) failed to download"},
+			wantLogs:   []string{"rpc.bin"},
 			wantSaved:  `{"1":{}}`,
 		},
 		{
@@ -200,7 +208,7 @@ func TestRunDownloadOutcomes(t *testing.T) {
 	} {
 		run := func(t *testing.T) {
 			timeout := 5 * time.Second
-			if test.flood {
+			if test.refusal != nil {
 				timeout = 2 * time.Minute
 			}
 			ctx, cancelTimeout := context.WithTimeout(t.Context(), timeout)
@@ -223,8 +231,8 @@ func TestRunDownloadOutcomes(t *testing.T) {
 				}
 			}
 			pool := downloadTestPool{invokers: test.invokers}
-			if test.flood {
-				var invoker tg.Invoker = downloadTestInvoker{err: tgerr.New(420, "FLOOD_WAIT_5")}
+			if test.refusal != nil {
+				var invoker tg.Invoker = downloadTestInvoker{err: test.refusal}
 				middlewares := tclient.NewDefaultMiddlewares(ctx, 5*time.Minute)
 				for i := len(middlewares) - 1; i >= 0; i-- {
 					invoker = middlewares[i].Handle(invoker)
@@ -277,12 +285,18 @@ func TestRunDownloadOutcomes(t *testing.T) {
 				}
 			}
 			require.Len(t, w.lines, len(test.wantLogs))
-			if test.flood {
+			if test.refusal != nil {
 				assert.NoError(t, ctx.Err())
-				assert.Contains(t, w.lines[0], "FLOOD_WAIT (5)")
+				assert.Contains(t, w.lines[0], test.refusal.Error())
 				assert.Contains(t, it.Finished(), 1)
 				assert.NotContains(t, it.Finished(), 0)
 				assert.FileExists(t, filepath.Join(dir, "sibling.bin"))
+				assert.NoFileExists(t, filepath.Join(dir, test.files[0]+tempExt))
+				require.Len(t, w.trackers, 2)
+				assert.True(t, w.trackers[0].IsDone())
+				assert.True(t, w.trackers[0].IsErrored())
+				assert.True(t, w.trackers[1].IsDone())
+				assert.False(t, w.trackers[1].IsErrored())
 			}
 			for _, name := range test.wantLogs {
 				count := 0
@@ -303,7 +317,7 @@ func TestRunDownloadOutcomes(t *testing.T) {
 			}
 		}
 		t.Run(test.name, func(t *testing.T) {
-			if test.flood {
+			if test.refusal != nil {
 				synctest.Test(t, run)
 			} else {
 				run(t)

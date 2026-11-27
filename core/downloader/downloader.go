@@ -66,6 +66,9 @@ func (d *Downloader) Download(ctx context.Context, limit int) error {
 	}
 
 	workerErr := wg.Wait()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if err := d.opts.Iter.Err(); err != nil {
 		return errors.Wrap(err, "iter")
 	}

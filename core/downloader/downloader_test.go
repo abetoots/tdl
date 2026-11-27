@@ -9,6 +9,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/gotd/td/bin"
@@ -363,12 +364,54 @@ func TestDownloadUserCancel(t *testing.T) {
 		if !errors.Is(doneErr, context.Canceled) {
 			t.Fatalf("OnDone received %v, want context.Canceled", doneErr)
 		}
-		if !strings.HasPrefix(err.Error(), "download: ") || errors.Unwrap(err) != doneErr {
-			t.Errorf("Download returned %v, want the OnDone error wrapped with download", err)
+		if err != ctx.Err() {
+			t.Errorf("Download returned %v, want the caller's context error", err)
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("Download did not return after cancel")
 	}
+}
+
+type blockedCompletionProgress struct {
+	*fakeProgress
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (p *blockedCompletionProgress) OnDone(elem Elem, err error) {
+	close(p.entered)
+	<-p.release
+	p.fakeProgress.OnDone(elem, err)
+}
+
+func TestDownloadUserCancelDuringJoinAfterSuccess(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+		progress := &blockedCompletionProgress{
+			fakeProgress: newFakeProgress(t, 1),
+			entered:      make(chan struct{}),
+			release:      make(chan struct{}),
+		}
+		d := New(Options{
+			Pool: fakePool{clients: map[int]tg.Invoker{2: successInvoker{}}}, Threads: 1,
+			Iter: &fakeIter{elems: []Elem{&fakeElem{dc: 2}}}, Progress: progress,
+		})
+		result := make(chan error, 1)
+		go func() { result <- d.Download(ctx, 1) }()
+
+		<-progress.entered
+		synctest.Wait()
+		cancel()
+		close(progress.release)
+
+		if err := <-result; !errors.Is(err, context.Canceled) {
+			t.Errorf("Download returned %v, want context.Canceled", err)
+		}
+		if err := progress.doneError(t); err != nil {
+			t.Errorf("OnDone received %v, want worker success", err)
+		}
+	})
 }
 
 func TestDownloadUserCancelStopsSiblingsAndWins(t *testing.T) {

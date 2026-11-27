@@ -27,12 +27,15 @@ func New(maxRetries uint) telegram.Middleware {
 			var timer *time.Timer
 			for {
 				err := next.Invoke(ctx, input, output)
+				if err == nil {
+					return nil
+				}
 				if ctxErr := ctx.Err(); ctxErr != nil {
 					return retry.WaitContextError(ctxErr, err)
 				}
 				delay, ok := tgerr.AsFloodWait(err)
 				if !ok {
-					if fileChunk && err != nil && isRetryableTimeout(err) {
+					if fileChunk && isRetryableTimeout(err) {
 						return errors.Errorf("file chunk failed: %v", err)
 					}
 					return err

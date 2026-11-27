@@ -61,7 +61,7 @@ func (f *Forwarder) Forward(ctx context.Context) error {
 		if _, ok := elem.Msg().GetGroupedID(); ok && elem.AsGrouped() {
 			grouped, err := tutil.GetGroupedMessages(ctx, f.opts.Pool.Default(ctx), elem.From().InputPeer(), elem.Msg())
 			if err != nil {
-				if errors.Is(err, context.Canceled) {
+				if ctx.Err() != nil {
 					return err
 				}
 				f.opts.Progress.OnAdd(elem)
@@ -77,8 +77,7 @@ func (f *Forwarder) Forward(ctx context.Context) error {
 		}
 
 		if err := f.forwardMessage(ctx, elem); err != nil {
-			// canceled by user, so we directly return error to stop all
-			if errors.Is(err, context.Canceled) {
+			if ctx.Err() != nil {
 				return err
 			}
 			continue

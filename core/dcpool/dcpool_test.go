@@ -32,6 +32,7 @@ type fakeAPI struct {
 	entered      chan struct{}
 	retryEntered chan struct{}
 	gate         <-chan struct{}
+	blockInit    bool
 	blockDC      bool
 }
 
@@ -73,6 +74,11 @@ func (a *fakeAPI) Invoke(ctx context.Context, input bin.Encoder, output bin.Deco
 	}
 	if err := ctx.Err(); err != nil {
 		return err
+	}
+	if a.blockInit {
+		<-a.gate
+		<-ctx.Done()
+		return ctx.Err()
 	}
 	if a.gate != nil {
 		select {
@@ -136,6 +142,12 @@ func clientWithin(t *testing.T, timeout time.Duration, get func() *tg.Client) *t
 
 func waitForTakeoutFollowers(t *testing.T, want int) {
 	t.Helper()
+	if blocked := countBlockedTakeoutFollowers(want); blocked != want {
+		t.Fatalf("%d of %d takeout followers blocked on the pool mutex", blocked, want)
+	}
+}
+
+func countBlockedTakeoutFollowers(want int) int {
 	buf := make([]byte, 64<<10)
 	deadline := time.Now().Add(2 * time.Second)
 	for {
@@ -146,15 +158,13 @@ func waitForTakeoutFollowers(t *testing.T, want int) {
 		}
 		blocked := 0
 		for stack := range strings.SplitSeq(string(buf[:n]), "\n\n") {
+			// mutex wait state checked against go 1.25.8.
 			if strings.Contains(stack, "[sync.Mutex.Lock]") && strings.Contains(stack, "(*pool).Takeout(") {
 				blocked++
 			}
 		}
-		if blocked == want {
-			return
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("%d of %d takeout followers blocked on the pool mutex", blocked, want)
+		if blocked == want || time.Now().After(deadline) {
+			return blocked
 		}
 		time.Sleep(time.Millisecond)
 	}
@@ -328,36 +338,62 @@ func TestTakeoutRoutesRequestsToDC(t *testing.T) {
 
 func TestTakeoutConcurrentCallers(t *testing.T) {
 	for _, tt := range []struct {
-		name    string
-		initErr error
+		name     string
+		initErr  error
+		timedOut bool
 	}{
 		{name: "init fails", initErr: errTakeoutInit},
 		{name: "network failure", initErr: errStub},
 		{name: "init succeeds"},
+		{name: "timed out", timedOut: true},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			entered, gate := make(chan struct{}), make(chan struct{})
-			api := &fakeAPI{initErr: tt.initErr, entered: entered, gate: gate}
+			api := &fakeAPI{initErr: tt.initErr, entered: entered, gate: gate, blockInit: tt.timedOut}
 			p := newPool(api, 1)
 			ctx := t.Context()
 			var wg sync.WaitGroup
-			wg.Go(func() {
-				_, _ = p.Takeout(ctx, 2).HelpGetConfig(ctx)
-			})
-			select {
-			case <-entered:
-			case <-time.After(2 * time.Second):
-				t.Fatal("takeout init never started")
-			}
-
 			const followers = 7
-			for range followers {
-				wg.Go(func() {
-					_, _ = p.Takeout(ctx, 2).HelpGetConfig(ctx)
-				})
+			startFollowers := func() {
+				for range followers {
+					wg.Go(func() { _, _ = p.Takeout(ctx, 2).HelpGetConfig(ctx) })
+				}
 			}
-			waitForTakeoutFollowers(t, followers)
-			close(gate)
+			if tt.timedOut {
+				// keep mutex waiters outside the bubble so the init deadline can advance.
+				queued := make(chan int, 1)
+				go func() {
+					defer close(gate)
+					select {
+					case <-entered:
+						startFollowers()
+						queued <- countBlockedTakeoutFollowers(followers)
+					case <-time.After(2 * time.Second):
+						queued <- 0
+					}
+				}()
+				synctest.Test(t, func(t *testing.T) {
+					start := time.Now()
+					client := takeoutWithin(t, p, t.Context(), 2, 32*time.Second)
+					if elapsed := time.Since(start); elapsed != 30*time.Second {
+						t.Errorf("takeout init took %v, want 30s", elapsed)
+					}
+					_, _ = client.HelpGetConfig(t.Context())
+				})
+				if blocked := <-queued; blocked != followers {
+					t.Fatalf("%d of %d takeout followers blocked before the timeout", blocked, followers)
+				}
+			} else {
+				wg.Go(func() { _, _ = p.Takeout(ctx, 2).HelpGetConfig(ctx) })
+				select {
+				case <-entered:
+				case <-time.After(2 * time.Second):
+					t.Fatal("takeout init never started")
+				}
+				startFollowers()
+				waitForTakeoutFollowers(t, followers)
+				close(gate)
+			}
 
 			waitForPoolCalls(t, &wg)
 			if calls := api.initCalls.Load(); calls != 1 {
@@ -367,7 +403,7 @@ func TestTakeoutConcurrentCallers(t *testing.T) {
 				t.Fatalf("recorded %d requests, want 8", len(api.invoker.inputs))
 			}
 			for idx, input := range api.invoker.inputs {
-				if tt.initErr != nil {
+				if tt.initErr != nil || tt.timedOut {
 					if _, ok := input.(*tg.HelpGetConfigRequest); !ok {
 						t.Errorf("request %d = %T, want *tg.HelpGetConfigRequest", idx, input)
 					}
@@ -530,14 +566,15 @@ func TestCloseDoesNotRaceTakeout(t *testing.T) {
 }
 
 func TestClientsAfterClose(t *testing.T) {
-	for _, test := range []struct {
+	clients := []struct {
 		name   string
 		client func(*pool, context.Context) *tg.Client
 	}{
 		{name: "Takeout", client: func(p *pool, ctx context.Context) *tg.Client { return p.Takeout(ctx, 4) }},
 		{name: "Client", client: func(p *pool, ctx context.Context) *tg.Client { return p.Client(ctx, 4) }},
 		{name: "Default", client: (*pool).Default},
-	} {
+	}
+	for _, test := range clients {
 		t.Run(test.name, func(t *testing.T) {
 			api := &fakeAPI{}
 			p := newPool(api, 1)
@@ -560,6 +597,28 @@ func TestClientsAfterClose(t *testing.T) {
 			}
 		})
 	}
+	t.Run("started", func(t *testing.T) {
+		api := &fakeAPI{}
+		p := newPool(api, 1)
+		ctx := t.Context()
+		takeoutWithin(t, p, ctx, 2, 2*time.Second)
+		if err := closeWithin(t, p, 2*time.Second); !errors.Is(err, errStub) {
+			t.Fatalf("Close error = %v, want %v from finish", err, errStub)
+		}
+		for _, test := range clients {
+			client := clientWithin(t, 2*time.Second, func() *tg.Client { return test.client(p, ctx) })
+			if _, err := client.HelpGetConfig(ctx); !errors.Is(err, errPoolClosed) {
+				t.Errorf("%s after Close returned %v, want %v", test.name, err, errPoolClosed)
+			}
+		}
+		if calls := api.initCalls.Load(); calls != 1 || len(api.dcs) != 0 {
+			t.Errorf("after Close there were %d init calls and %d DC invokers, want 1 and 0", calls, len(api.dcs))
+		}
+		if len(api.invoker.inputs) != 1 {
+			t.Fatalf("recorded %d requests, want only the finish request", len(api.invoker.inputs))
+		}
+		assertFinishTakeoutRequest(t, api.invoker.inputs[0])
+	})
 }
 
 func TestCloseFinishesTakeoutOnlyWhenStarted(t *testing.T) {
@@ -597,25 +656,30 @@ func TestCloseFinishesTakeoutOnlyWhenStarted(t *testing.T) {
 		if len(api.invoker.inputs) != 1 {
 			t.Fatalf("recorded %d requests, want 1", len(api.invoker.inputs))
 		}
-		wrapped, ok := api.invoker.inputs[0].(*tg.InvokeWithTakeoutRequest)
-		if !ok {
-			t.Fatalf("request = %T, want *tg.InvokeWithTakeoutRequest", api.invoker.inputs[0])
-		}
-		if wrapped.TakeoutID != 42 {
-			t.Errorf("takeout ID = %d, want 42", wrapped.TakeoutID)
-		}
-		var buf bin.Buffer
-		if err := wrapped.Query.Encode(&buf); err != nil {
-			t.Fatalf("encode query: %v", err)
-		}
-		id, err := buf.PeekID()
-		if err != nil || id != tg.AccountFinishTakeoutSessionRequestTypeID {
-			t.Errorf("query ID = %#x, error = %v, want %#x with no error", id, err, tg.AccountFinishTakeoutSessionRequestTypeID)
-		}
+		assertFinishTakeoutRequest(t, api.invoker.inputs[0])
 		if api.invoker.closeCalls != 1 {
 			t.Errorf("invoker Close calls = %d, want 1", api.invoker.closeCalls)
 		}
 	})
+}
+
+func assertFinishTakeoutRequest(t *testing.T, input bin.Encoder) {
+	t.Helper()
+	wrapped, ok := input.(*tg.InvokeWithTakeoutRequest)
+	if !ok {
+		t.Fatalf("request = %T, want *tg.InvokeWithTakeoutRequest", input)
+	}
+	if wrapped.TakeoutID != 42 {
+		t.Errorf("takeout ID = %d, want 42", wrapped.TakeoutID)
+	}
+	var buf bin.Buffer
+	if err := wrapped.Query.Encode(&buf); err != nil {
+		t.Fatalf("encode query: %v", err)
+	}
+	id, err := buf.PeekID()
+	if err != nil || id != tg.AccountFinishTakeoutSessionRequestTypeID {
+		t.Errorf("query ID = %#x, error = %v, want %#x with no error", id, err, tg.AccountFinishTakeoutSessionRequestTypeID)
+	}
 }
 
 func TestCloseIsIdempotent(t *testing.T) {

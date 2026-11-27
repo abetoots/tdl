@@ -106,15 +106,24 @@ func newBackoff(timeout time.Duration) backoff.BackOff {
 }
 
 func RunWithAuth(ctx context.Context, client *telegram.Client, f func(ctx context.Context) error) error {
-	return client.Run(ctx, func(ctx context.Context) error {
-		status, err := client.Auth().Status(ctx)
+	// gotd can cancel the callback context when the connection dies.
+	err := client.Run(ctx, func(runCtx context.Context) error {
+		status, err := client.Auth().Status(runCtx)
 		if err != nil {
-			return err
+			return normalizeRunError(ctx, err)
 		}
 		if !status.Authorized {
 			return fmt.Errorf("not authorized. please login first")
 		}
 
-		return f(ctx)
+		return normalizeRunError(ctx, f(runCtx))
 	})
+	return normalizeRunError(ctx, err)
+}
+
+func normalizeRunError(ctx context.Context, err error) error {
+	if ctx.Err() == nil && errors.Is(err, context.Canceled) {
+		return fmt.Errorf("connection lost: %v", err)
+	}
+	return err
 }

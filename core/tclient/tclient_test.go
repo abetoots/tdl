@@ -79,15 +79,6 @@ func TestDefaultMiddlewaresErrorContract(t *testing.T) {
 	deadlineErr := fmt.Errorf("transport request expired: %w", context.DeadlineExceeded)
 	netTimeout := &net.DNSError{Err: "transport timed out", IsTimeout: true}
 	transportErr := errors.New("connection lost")
-	const lateFailure = 310 * time.Second
-	lateTransport := func(_ context.Context, call int, start time.Time) error {
-		if call == 1 {
-			time.Sleep(time.Until(start.Add(lateFailure)))
-			return transportErr
-		}
-		time.Sleep(time.Until(start.Add(lateFailure + time.Second)))
-		return nil
-	}
 	cases := []chainCase{
 		{name: "chunk ordinary flood", chunk: true, failure: floodErr, wantCalls: 11, wantElapsed: 50 * time.Second, wantText: floodErr.Error()},
 		{name: "other ordinary flood", reply: failForCalls(floodErr, 12, time.Minute), wantCalls: 13, wantElapsed: time.Minute},
@@ -95,17 +86,6 @@ func TestDefaultMiddlewaresErrorContract(t *testing.T) {
 		{name: "other premium flood", reply: failForCalls(premiumErr, 12, time.Minute), wantCalls: 13, wantElapsed: time.Minute},
 		{name: "chunk Telegram 400", chunk: true, failure: layerErr, wantCalls: 1, wantRPC: layerInvalid, wantText: layerErr.Error()},
 		{name: "other Telegram 400", failure: layerErr, wantCalls: 1, wantRPC: layerInvalid, wantText: layerErr.Error()},
-		{name: "chunk transport deadline", chunk: true, reply: failAt(deadlineErr, 2, reconnectBudget), wantCalls: 2, wantElapsed: reconnectBudget, wantText: deadlineErr.Error()},
-		{name: "other transport deadline", reply: failAt(deadlineErr, 2, reconnectBudget), wantCalls: 2, wantElapsed: reconnectBudget, wantText: deadlineErr.Error(), wantDeadline: true, wantNetTimeout: true},
-		{name: "chunk net timeout", chunk: true, reply: failAt(netTimeout, 2, reconnectBudget), wantCalls: 2, wantElapsed: reconnectBudget, wantText: netTimeout.Error()},
-		{name: "other net timeout", reply: failAt(netTimeout, 2, reconnectBudget), wantCalls: 2, wantElapsed: reconnectBudget, wantText: netTimeout.Error(), wantNetTimeout: true},
-		{name: "chunk non-timeout transport", chunk: true, reply: failAt(transportErr, 2, reconnectBudget), wantCalls: 2, wantElapsed: reconnectBudget, wantText: transportErr.Error()},
-		{name: "other non-timeout transport", reply: failAt(transportErr, 2, reconnectBudget), wantCalls: 2, wantElapsed: reconnectBudget, wantText: transportErr.Error()},
-		{name: "chunk transport with unlimited recovery", chunk: true, unlimited: true, reply: lateTransport, wantCalls: 2, wantElapsed: lateFailure + time.Second},
-		{name: "other transport with unlimited recovery", unlimited: true, reply: lateTransport, wantCalls: 2, wantElapsed: lateFailure + time.Second},
-		{name: "other transport recovery", reply: failForCalls(transportErr, 2, 2*time.Second), wantCalls: 3, wantElapsed: 2 * time.Second},
-		{name: "chunk RPC with unlimited recovery", chunk: true, unlimited: true, failure: rpcErr, wantCalls: 5, wantElapsed: time.Minute, wantRPC: rpcCallFail, wantText: rpcErr.Error()},
-		{name: "other RPC with unlimited recovery", unlimited: true, failure: rpcErr, cancelAt: 320 * time.Second, wantCalls: 28, wantElapsed: 320 * time.Second, wantText: rpcErr.Error(), wantCanceled: true},
 		{
 			name: "other RPC recovers after 70s",
 			reply: func(_ context.Context, _ int, start time.Time) error {
@@ -123,6 +103,65 @@ func TestDefaultMiddlewaresErrorContract(t *testing.T) {
 		{name: "chunk deadline during retry", chunk: true, failure: rpcErr, deadlineAt: time.Second, wantCalls: 1, wantElapsed: time.Second, wantText: rpcErr.Error(), wantDeadline: true},
 		{name: "other deadline during flood", failure: floodErr, deadlineAt: time.Second, wantCalls: 1, wantElapsed: time.Second, wantText: floodErr.Error(), wantDeadline: true},
 		{
+			name: "chunk succeeds as context ends", chunk: true, cancelAt: time.Second,
+			reply: func(ctx context.Context, _ int, _ time.Time) error {
+				<-ctx.Done()
+				return nil
+			},
+			wantCalls: 1, wantElapsed: time.Second,
+		},
+	}
+
+	retryTypes := []string{
+		"Timedout",
+		"No workers running",
+		rpcCallFail,
+		"RPC_MCGET_FAIL",
+		"WORKER_BUSY_TOO_LONG_RETRY",
+		"memory limit exit",
+		tg.ErrTimeout,
+	}
+	for _, typ := range retryTypes {
+		err := tgerr.New(500, typ)
+		wantRPC := typ
+		if typ == tg.ErrTimeout {
+			wantRPC = ""
+		}
+		cases = append(cases, chainCase{
+			name: "chunk " + typ, chunk: true, failure: err, wantCalls: 5, wantElapsed: time.Minute,
+			wantRPC: wantRPC, wantText: err.Error(),
+		})
+	}
+
+	for _, tt := range cases {
+		tt.name += " unlimited"
+		tt.unlimited = true
+		cases = append(cases, tt)
+	}
+
+	for _, typ := range retryTypes {
+		err := tgerr.New(500, typ)
+		// start the second retry batch at 4m regardless of recovery jitter.
+		reply := failAt(err, 6, 4*time.Minute)
+		cases = append(cases,
+			chainCase{name: "other " + typ, reply: reply, wantCalls: 10, wantElapsed: reconnectBudget, wantText: err.Error()},
+			// the unlimited case starts another batch after the finite budget.
+			chainCase{
+				name: "other " + typ + " unlimited", unlimited: true, reply: reply, cancelAt: 301 * time.Second,
+				wantCalls: 11, wantElapsed: 301 * time.Second, wantText: err.Error(), wantCanceled: true,
+			},
+		)
+	}
+
+	cases = append(cases, []chainCase{
+		{name: "chunk transport deadline", chunk: true, reply: failAt(deadlineErr, 2, reconnectBudget), wantCalls: 2, wantElapsed: reconnectBudget, wantText: deadlineErr.Error()},
+		{name: "other transport deadline", reply: failAt(deadlineErr, 2, reconnectBudget), wantCalls: 2, wantElapsed: reconnectBudget, wantText: deadlineErr.Error(), wantDeadline: true, wantNetTimeout: true},
+		{name: "chunk net timeout", chunk: true, reply: failAt(netTimeout, 2, reconnectBudget), wantCalls: 2, wantElapsed: reconnectBudget, wantText: netTimeout.Error()},
+		{name: "other net timeout", reply: failAt(netTimeout, 2, reconnectBudget), wantCalls: 2, wantElapsed: reconnectBudget, wantText: netTimeout.Error(), wantNetTimeout: true},
+		{name: "chunk non-timeout transport", chunk: true, reply: failAt(transportErr, 2, reconnectBudget), wantCalls: 2, wantElapsed: reconnectBudget, wantText: transportErr.Error()},
+		{name: "other non-timeout transport", reply: failAt(transportErr, 2, reconnectBudget), wantCalls: 2, wantElapsed: reconnectBudget, wantText: transportErr.Error()},
+		{name: "other transport recovery", reply: failForCalls(transportErr, 2, 2*time.Second), wantCalls: 3, wantElapsed: 2 * time.Second},
+		{
 			name:  "chunk canceled transport",
 			chunk: true,
 			reply: func(ctx context.Context, _ int, _ time.Time) error {
@@ -131,26 +170,34 @@ func TestDefaultMiddlewaresErrorContract(t *testing.T) {
 			},
 			cancelAt: time.Second, wantCalls: 1, wantElapsed: time.Second, wantText: context.Canceled.Error(), wantCanceled: true,
 		},
-	}
-
-	for _, typ := range []string{
-		"Timedout",
-		"No workers running",
-		rpcCallFail,
-		"RPC_MCGET_FAIL",
-		"WORKER_BUSY_TOO_LONG_RETRY",
-		"memory limit exit",
-		tg.ErrTimeout,
+		{name: "other RPC with unlimited recovery", unlimited: true, failure: rpcErr, cancelAt: 320 * time.Second, wantCalls: 28, wantElapsed: 320 * time.Second, wantText: rpcErr.Error(), wantCanceled: true},
+	}...)
+	const lateFailure = 310 * time.Second
+	for _, tt := range []struct {
+		name string
+		err  error
+	}{
+		{name: "plain transport", err: transportErr},
+		{name: "transport deadline", err: deadlineErr},
+		{name: "net timeout", err: netTimeout},
 	} {
-		err := tgerr.New(500, typ)
-		wantRPC := typ
-		if typ == tg.ErrTimeout {
-			wantRPC = ""
+		reply := func(_ context.Context, call int, start time.Time) error {
+			if call == 1 {
+				time.Sleep(time.Until(start.Add(lateFailure)))
+				return tt.err
+			}
+			time.Sleep(time.Until(start.Add(lateFailure + time.Second)))
+			return nil
 		}
 		cases = append(cases,
-			chainCase{name: "chunk " + typ, chunk: true, failure: err, wantCalls: 5, wantElapsed: time.Minute, wantRPC: wantRPC, wantText: err.Error()},
-			// start the second retry batch at 4m regardless of recovery jitter.
-			chainCase{name: "other " + typ, reply: failAt(err, 6, 4*time.Minute), wantCalls: 10, wantElapsed: reconnectBudget, wantText: err.Error()},
+			chainCase{
+				name: "chunk " + tt.name + " with unlimited recovery", chunk: true, unlimited: true, reply: reply,
+				wantCalls: 2, wantElapsed: lateFailure + time.Second,
+			},
+			chainCase{
+				name: "other " + tt.name + " with unlimited recovery", unlimited: true, reply: reply,
+				wantCalls: 2, wantElapsed: lateFailure + time.Second,
+			},
 		)
 	}
 
