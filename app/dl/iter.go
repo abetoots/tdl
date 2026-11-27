@@ -237,16 +237,18 @@ func (i *iter) process(ctx context.Context) (ret bool, skip bool) {
 }
 
 func messageTopicID(message *tg.Message, from peers.Peer) int {
+	if channel, ok := from.(peers.Channel); !ok || !channel.Raw().Forum {
+		return 0
+	}
 	if reply, ok := message.ReplyTo.(*tg.MessageReplyHeader); ok && reply.ForumTopic {
 		if reply.ReplyToTopID != 0 {
 			return reply.ReplyToTopID
 		}
-		return reply.ReplyToMsgID
+		if reply.ReplyToMsgID != 0 && reply.ReplyToPeerID == nil {
+			return reply.ReplyToMsgID
+		}
 	}
-	if channel, ok := from.(peers.Channel); ok && channel.Raw().Forum {
-		return 1
-	}
-	return 0
+	return 1
 }
 
 func (i *iter) topicTitle(ctx context.Context, from peers.Peer, topicID int) (string, error) {
@@ -264,13 +266,29 @@ func (i *iter) topicTitle(ctx context.Context, from peers.Peer, topicID int) (st
 		i.topicTitles[dialogID] = titles
 	}
 
-	if title, ok := titles[topicID]; ok {
-		return title, nil
+	title, ok := titles[topicID]
+	if !ok {
+		result, err := i.pool.Default(ctx).MessagesGetForumTopicsByID(ctx, &tg.MessagesGetForumTopicsByIDRequest{
+			Peer: from.InputPeer(), Topics: []int{topicID},
+		})
+		if err != nil {
+			return "", errors.Wrap(err, "get forum topics by id")
+		}
+		if topicID == 1 {
+			title = "General"
+		}
+		for _, topic := range result.Topics {
+			if found, ok := topic.(*tg.ForumTopic); ok && found.ID == topicID {
+				title = found.Title
+				break
+			}
+		}
+		titles[topicID] = title
 	}
-	if topicID == 1 {
-		return "General", nil
+	if title == "" {
+		return fmt.Sprintf("topic %d", topicID), nil
 	}
-	return fmt.Sprintf("topic %d", topicID), nil
+	return title, nil
 }
 
 func (i *iter) processSingle(ctx context.Context, message *tg.Message, from peers.Peer, logicalPos int) (bool, bool) {

@@ -14,17 +14,17 @@ bookToC: false
 
 ### 变量 (Beta)
 
-|       变量       |          描述           |
-|:--------------:|:---------------------:|
-|   `DialogID`   |     Telegram 对话ID     |
-|   `TopicID`    | 话题 ID（`1` 常规，`0` 非论坛） |
-|  `TopicTitle`  |     论坛话题标题（非论坛为空）     |
-|  `MessageID`   |     Telegram 消息ID     |
-| `MessageDate`  |  Telegram 消息日期（时间戳）   |
-|   `FileName`   |     Telegram 文件名      |
-| `FileCaption`  | Telegram 文件说明，也就是文本消息 |
-|   `FileSize`   |   可读的文件大小，例如 `1GB`    |
-| `DownloadDate` |       下载日期（时间戳）       |
+|       变量       |                            描述                             |
+|:--------------:|:---------------------------------------------------------:|
+|   `DialogID`   |                       Telegram 对话ID                       |
+|   `TopicID`    |              话题 ID（常规话题为 `1`，启用话题的群组之外为 `0`）              |
+|  `TopicTitle`  | 仅适用于启用话题的群组。标题未经处理，请始终使用 `filenamify`。每次运行时，每个群组获取一次话题列表。 |
+|  `MessageID`   |                       Telegram 消息ID                       |
+| `MessageDate`  |                    Telegram 消息日期（时间戳）                     |
+|   `FileName`   |                       Telegram 文件名                        |
+| `FileCaption`  |                   Telegram 文件说明，也就是文本消息                   |
+|   `FileSize`   |                     可读的文件大小，例如 `1GB`                      |
+| `DownloadDate` |                         下载日期（时间戳）                         |
 
 ### 函数 (Beta)
 
@@ -56,19 +56,19 @@ bookToC: false
 {{ formatDate (now) }}
 ```
 
-以下命令将论坛群组的导出文件按话题下载到各自的文件夹。
+以下命令将启用话题的群组中的文件按话题下载到各自的文件夹。
 
 ```sh
-tdl dl -f whole-group.json -t '{{ .TopicID }}/{{ .DialogID }}_{{ .MessageID }}_{{ filenamify .FileName }}'
+tdl dl -f whole-group.json --template '{{ .TopicID }}/{{ .DialogID }}_{{ .MessageID }}_{{ filenamify .FileName }}'
 ```
 
-也可以在文件夹名称中加入话题标题。
+也可以在文件夹名称中加入话题标题。对于启用话题的群组以外的聊天，此示例使用 `0/`。将标题限制为 60 个字符，即使含有多字节字符，文件夹名称也不会超过 255 字节。
 
 ```sh
-tdl dl -f whole-group.json -t '{{ .TopicID }} {{ filenamify .TopicTitle }}/{{ .DialogID }}_{{ .MessageID }}_{{ filenamify .FileName }}'
+tdl dl -f whole-group.json --template '{{ .TopicID }}{{ with .TopicTitle }} {{ filenamify . 60 }}{{ end }}/{{ .DialogID }}_{{ .MessageID }}_{{ filenamify .FileName }}'
 ```
 
-重命名话题会改变文件夹名称。之后使用 `--skip-same` 下载时，将找不到保存在旧文件夹中的文件。若要保持文件夹名称稳定，请仅使用 `{{ .TopicID }}`。
+重命名话题会改变文件夹名称。之后使用 `--skip-same` 下载时，将找不到保存在旧文件夹中的文件。使用 `--continue` 继续下载时，该话题中尚未下载完成的文件会保存到新文件夹。若要保持文件夹名称稳定，请仅使用 `{{ .TopicID }}`。
 
 ### 默认：
 

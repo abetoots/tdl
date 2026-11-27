@@ -18,6 +18,7 @@ func TestProcessChannelListsForumTopicPages(t *testing.T) {
 	for index := range firstPage {
 		firstPage[index] = &tg.ForumTopic{ID: index + 1, Title: "Existing"}
 	}
+	firstPage[99].(*tg.ForumTopic).TopMessage = 200
 	pages := []tg.MessagesForumTopics{
 		{Count: 101, Topics: firstPage, Messages: []tg.MessageClass{&tg.Message{ID: 200, Date: 300}}},
 		{Count: 101, Topics: []tg.ForumTopicClass{&tg.ForumTopic{ID: 101, Title: "Release notes"}}},

@@ -15,7 +15,7 @@ type ForumTopic struct {
 	Title string
 }
 
-// pagination reference: https://github.com/telegramdesktop/tdesktop/blob/4047f1733decd5edf96d125589f128758b68d922/Telegram/SourceFiles/data/data_forum.cpp#L135
+// see https://core.telegram.org/constructor/messages.forumTopics for pagination.
 func GetForumTopics(ctx context.Context, api *tg.Client, peer tg.InputPeerClass) ([]ForumTopic, error) {
 	const limit = 100
 	log := logctx.From(ctx)
@@ -54,29 +54,31 @@ func GetForumTopics(ctx context.Context, api *tg.Client, peer tg.InputPeerClass)
 			break
 		}
 
-		for _, tp := range topics.Topics {
-			if t, ok := tp.(*tg.ForumTopic); ok {
-				res = append(res, ForumTopic{ID: t.ID, Title: t.Title})
-				offsetTopic = t.ID
+		var lastTopic *tg.ForumTopic
+		for _, topic := range topics.Topics {
+			if forumTopic, ok := topic.(*tg.ForumTopic); ok {
+				res = append(res, ForumTopic{ID: forumTopic.ID, Title: forumTopic.Title})
+				lastTopic = forumTopic
 			}
 		}
 
-		if len(res) >= topics.Count || len(topics.Topics) < limit {
+		if len(res) >= topics.Count {
 			break
 		}
-
-		msgCount := len(topics.Messages)
-		if msgCount > 0 {
-			if lastMsg, ok := topics.Messages[msgCount-1].AsNotEmpty(); ok {
-				offsetID, offsetDate = lastMsg.GetID(), lastMsg.GetDate()
-			} else {
-				log.Debug("no valid message for offset, relying on offsetTopic only",
-					zap.Int("offset_topic", offsetTopic))
+		if lastTopic == nil {
+			continue
+		}
+		offsetTopic = lastTopic.ID
+		offsetID, offsetDate = 0, 0
+		if topics.OrderByCreateDate {
+			offsetDate = lastTopic.Date
+			continue
+		}
+		for _, message := range topics.Messages {
+			if msg, ok := message.AsNotEmpty(); ok && msg.GetID() == lastTopic.TopMessage {
+				offsetID, offsetDate = msg.GetID(), msg.GetDate()
+				break
 			}
-		} else {
-			log.Debug("no messages in topics response, relying on offsetTopic only",
-				zap.Int("offset_topic", offsetTopic),
-				zap.Int("topics_count", len(topics.Topics)))
 		}
 	}
 
