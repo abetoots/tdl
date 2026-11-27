@@ -14,36 +14,18 @@ import (
 func TestMessageTopicID(t *testing.T) {
 	manager := peers.Options{}.Build(nil)
 	forum := manager.Channel(&tg.Channel{ID: 42, Megagroup: true, Forum: true})
-	channel := manager.Channel(&tg.Channel{ID: 43, Broadcast: true})
 	tests := []struct {
 		name  string
-		from  peers.Peer
 		reply *tg.MessageReplyHeader
 		want  int
 	}{
-		{
-			name:  "reply inside a topic",
-			from:  forum,
-			reply: &tg.MessageReplyHeader{ForumTopic: true, ReplyToTopID: 5, ReplyToMsgID: 8},
-			want:  5,
-		},
-		{
-			name:  "message directly in a topic",
-			from:  forum,
-			reply: &tg.MessageReplyHeader{ForumTopic: true, ReplyToMsgID: 5},
-			want:  5,
-		},
-		{
-			name:  "ordinary reply in General",
-			from:  forum,
-			reply: &tg.MessageReplyHeader{ReplyToMsgID: 8},
-			want:  1,
-		},
-		{
-			name: "channel outside a forum",
-			from: channel,
-			want: 0,
-		},
+		{"reply inside a topic", &tg.MessageReplyHeader{ForumTopic: true, ReplyToTopID: 5, ReplyToMsgID: 8}, 5},
+		{"message directly in a topic", &tg.MessageReplyHeader{ForumTopic: true, ReplyToMsgID: 5}, 5},
+		{"topic header with no ids", &tg.MessageReplyHeader{ForumTopic: true}, 1},
+		{"cross-chat reply", &tg.MessageReplyHeader{ForumTopic: true, ReplyToMsgID: 8, ReplyToPeerID: &tg.PeerChannel{ChannelID: 99}}, 1},
+		{"cross-chat reply inside a topic", &tg.MessageReplyHeader{ForumTopic: true, ReplyToTopID: 5, ReplyToMsgID: 8, ReplyToPeerID: &tg.PeerChannel{ChannelID: 99}}, 5},
+		{"ordinary reply in General", &tg.MessageReplyHeader{ReplyToMsgID: 8}, 1},
+		{"no reply header", nil, 1},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -51,8 +33,32 @@ func TestMessageTopicID(t *testing.T) {
 			if tt.reply != nil {
 				message.SetReplyTo(tt.reply)
 			}
-			require.Equal(t, tt.want, messageTopicID(message, tt.from))
+			require.Equal(t, tt.want, messageTopicID(message, forum))
 		})
+	}
+	for _, tt := range nonForumTopicTestPeers(manager) {
+		t.Run(tt.name, func(t *testing.T) {
+			message := &tg.Message{}
+			require.Zero(t, messageTopicID(message, tt.peer))
+			message.SetReplyTo(&tg.MessageReplyHeader{ForumTopic: true, ReplyToTopID: 5, ReplyToMsgID: 8})
+			require.Zero(t, messageTopicID(message, tt.peer))
+		})
+	}
+}
+
+func nonForumTopicTestPeers(manager *peers.Manager) []struct {
+	name string
+	peer peers.Peer
+} {
+	return []struct {
+		name string
+		peer peers.Peer
+	}{
+		{"broadcast channel", manager.Channel(&tg.Channel{ID: 43, Broadcast: true})},
+		{"supergroup without topics", manager.Channel(&tg.Channel{ID: 44, Megagroup: true})},
+		{"basic group", manager.Chat(&tg.Chat{ID: 45})},
+		{"private chat", manager.User(&tg.User{ID: 46})},
+		{"bot chat with topics", manager.User(&tg.User{ID: 47, Bot: true, BotForumView: true})},
 	}
 }
 

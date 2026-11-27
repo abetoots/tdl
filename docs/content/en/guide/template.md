@@ -14,17 +14,17 @@ Template syntax is based on [Go's text/template](https://golang.org/pkg/text/tem
 
 ### Variables (beta)
 
-|      Var       |                   Desc                   |
-|:--------------:|:----------------------------------------:|
-|   `DialogID`   |            Telegram dialog id            |
-|   `TopicID`    |  Topic ID (`1` General, `0` non-forum)   |
-|  `TopicTitle`  | Forum topic title, empty outside forums  |
-|  `MessageID`   |           Telegram message id            |
-| `MessageDate`  |     Telegram message date(timestamp)     |
-|   `FileName`   |            Telegram file name            |
-| `FileCaption`  | Telegram file caption, aka. text message |
-|   `FileSize`   |   Human-readable file size, like `1GB`   |
-| `DownloadDate` |         Download date(timestamp)         |
+|      Var       |                                                   Desc                                                    |
+|:--------------:|:---------------------------------------------------------------------------------------------------------:|
+|   `DialogID`   |                                            Telegram dialog id                                             |
+|   `TopicID`    |                          Topic ID (`1` General, `0` outside groups with topics)                           |
+|  `TopicTitle`  | Raw title for groups with topics. Always use `filenamify`. Fetches the topic list once per group per run. |
+|  `MessageID`   |                                            Telegram message id                                            |
+| `MessageDate`  |                                     Telegram message date(timestamp)                                      |
+|   `FileName`   |                                            Telegram file name                                             |
+| `FileCaption`  |                                 Telegram file caption, aka. text message                                  |
+|   `FileSize`   |                                   Human-readable file size, like `1GB`                                    |
+| `DownloadDate` |                                         Download date(timestamp)                                          |
 
 ### Functions (beta)
 
@@ -56,19 +56,19 @@ Template syntax is based on [Go's text/template](https://golang.org/pkg/text/tem
 {{ formatDate (now) }}
 ```
 
-Use the topic ID as the first path component to download a forum export into one folder per topic.
+Use the topic ID as the first path component to download files into one folder per topic in groups with topics.
 
 ```sh
-tdl dl -f whole-group.json -t '{{ .TopicID }}/{{ .DialogID }}_{{ .MessageID }}_{{ filenamify .FileName }}'
+tdl dl -f whole-group.json --template '{{ .TopicID }}/{{ .DialogID }}_{{ .MessageID }}_{{ filenamify .FileName }}'
 ```
 
-Include the topic title in each folder name.
+Include the topic title in the folder name. The example uses `0/` outside groups with topics. Limiting the title to 60 characters keeps the folder name within 255 bytes, including multibyte characters.
 
 ```sh
-tdl dl -f whole-group.json -t '{{ .TopicID }} {{ filenamify .TopicTitle }}/{{ .DialogID }}_{{ .MessageID }}_{{ filenamify .FileName }}'
+tdl dl -f whole-group.json --template '{{ .TopicID }}{{ with .TopicTitle }} {{ filenamify . 60 }}{{ end }}/{{ .DialogID }}_{{ .MessageID }}_{{ filenamify .FileName }}'
 ```
 
-Renaming a topic changes its folder name. A later run with `--skip-same` will miss files saved under the old name. Use `{{ .TopicID }}` alone for stable folder names.
+Renaming a topic changes its folder name. A later run with `--skip-same` will miss files saved under the old name. With `--continue`, unfinished files for that topic go into the new folder. Use `{{ .TopicID }}` alone for stable folder names.
 
 ### Default:
 

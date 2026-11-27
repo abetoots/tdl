@@ -180,7 +180,10 @@ func GetSingleMessage(ctx context.Context, c *tg.Client, peer tg.InputPeerClass,
 		BatchSize(1).Iter()
 
 	if !it.Next(ctx) {
-		return nil, errors.Wrap(it.Err(), "get single message")
+		if err := it.Err(); err != nil {
+			return nil, errors.Wrap(err, "get single message")
+		}
+		return nil, ErrMessageDeleted
 	}
 
 	m, ok := it.Value().Msg.(*tg.Message)
