@@ -1,0 +1,9 @@
+# fork: hugo-book's zh tokenizer drops every ascii character, so latin words such as docker or tdl found nothing
+- id: bookSearchConfig
+  translation: |
+    {
+      encode: false,
+      tokenize: function(str) {
+        return str.toLowerCase().match(/[a-z0-9]+|[^\x00-\x7F]/g) || [];
+      }
+    }

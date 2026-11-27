@@ -6,7 +6,7 @@ weight: 10
 # Installation
 
 {{< hint warning >}}
-These instructions install upstream's releases, which don't include this fork's changes. To use the fork, [build it from source](/fork#installing).
+These instructions, and `tdl update`, install upstream's releases, which don't include this fork's changes. To use the fork, follow [the fork's build steps](/fork/#installing).
 {{< /hint >}}
 
 ## One-Line Scripts
