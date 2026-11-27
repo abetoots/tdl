@@ -10,6 +10,7 @@ import (
 
 	"github.com/gotd/td/bin"
 	"github.com/gotd/td/telegram"
+	"github.com/gotd/td/tg"
 	"github.com/gotd/td/tgerr"
 )
 
@@ -24,7 +25,7 @@ func TestRetryExhaustion(t *testing.T) {
 			return tgerr.New(500, rpcCallFail)
 		})
 
-		err := New(5).Handle(next)(t.Context(), nil, nil)
+		err := New(5).Handle(next)(t.Context(), &tg.UploadGetFileRequest{}, &tg.UploadFileBox{})
 		if !tgerr.Is(err, rpcCallFail) {
 			t.Errorf("Invoke error = %v, want %s", err, rpcCallFail)
 		}
@@ -88,4 +89,18 @@ func TestRetrySucceedsOnThirdAttempt(t *testing.T) {
 			t.Errorf("Invoke made %d attempts, want 3", calls)
 		}
 	})
+}
+
+func TestRetryWithZeroAttemptsStillInvokesNext(t *testing.T) {
+	calls := 0
+	next := telegram.InvokeFunc(func(context.Context, bin.Encoder, bin.Decoder) error {
+		calls++
+		return nil
+	})
+	if err := New(0).Handle(next)(t.Context(), &tg.UploadGetFileRequest{}, &tg.UploadFileBox{}); err != nil {
+		t.Errorf("Invoke error = %v, want nil", err)
+	}
+	if calls != 1 {
+		t.Errorf("Invoke made %d attempts, want 1", calls)
+	}
 }

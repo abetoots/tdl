@@ -12,10 +12,12 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/iyear/tdl/core/logctx"
+	"github.com/iyear/tdl/core/util/tutil"
 )
 
 var internalErrors = []string{
 	"Timedout", // #373
+	tg.ErrTimeout,
 	"No workers running",
 	"RPC_CALL_FAIL",
 	"RPC_MCGET_FAIL",
@@ -57,12 +59,18 @@ func (r retry) Handle(next tg.Invoker) telegram.InvokeFunc {
 			lastErr = err
 		}
 
-		return errors.Wrapf(lastErr, "retry limit reached after %d attempts", r.max)
+		if tutil.IsFileChunk(output) {
+			return errors.Wrapf(lastErr, "retry limit reached after %d attempts", r.max)
+		}
+		return errors.Errorf("retry limit reached after %d attempts: %v", r.max, lastErr)
 	}
 }
 
 // New returns middleware that retries request if it fails with one of provided errors.
 func New(max int, errors ...string) telegram.Middleware {
+	if max < 1 {
+		max = 1
+	}
 	return retry{
 		max:    max,
 		errors: append(errors, internalErrors...), // #373

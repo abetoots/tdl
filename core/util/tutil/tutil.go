@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/go-faster/errors"
+	"github.com/gotd/td/bin"
 	"github.com/gotd/td/telegram/peers"
 	"github.com/gotd/td/telegram/query"
 	"github.com/gotd/td/tg"
@@ -15,6 +16,12 @@ import (
 
 // ErrMessageDeleted is returned when a message is detected as deleted.
 var ErrMessageDeleted = errors.New("message may be deleted")
+
+// check the output because takeout only wraps the request.
+func IsFileChunk(output bin.Decoder) bool {
+	_, ok := output.(*tg.UploadFileBox)
+	return ok
+}
 
 // ParseMessageLink return dialog id, msg id, error
 func ParseMessageLink(ctx context.Context, manager *peers.Manager, s string) (peers.Peer, int, error) {
@@ -224,7 +231,7 @@ func GetGroupedMessages(ctx context.Context, c *tg.Client, peer tg.InputPeerClas
 		BatchSize(batchSize).Iter()
 
 	messages := make([]*tg.Message, 0, batchSize)
-	for i := 0; it.Next(ctx) && i < batchSize; i++ {
+	for i := 0; i < batchSize && it.Next(ctx); i++ {
 		m, ok := it.Value().Msg.(*tg.Message)
 		if !ok {
 			continue
@@ -244,6 +251,9 @@ func GetGroupedMessages(ctx context.Context, c *tg.Client, peer tg.InputPeerClas
 		} else {
 			messages = append(messages, m)
 		}
+	}
+	if err := it.Err(); err != nil {
+		return nil, errors.Wrap(err, "get grouped messages")
 	}
 
 	// reverse messages from oldest to latest, so we can forward them in order

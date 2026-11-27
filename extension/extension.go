@@ -36,8 +36,7 @@ type Env struct {
 type Options struct {
 	// UpdateHandler will be passed to telegram.Client Options.
 	UpdateHandler telegram.UpdateHandler
-	// Middlewares will be passed to telegram.Client Options,
-	// and recovery,retry,flood-wait will be used if nil.
+	// middlewares are appended to the default client middlewares.
 	Middlewares []telegram.Middleware
 	// Logger will be used as extension logger,
 	// and default logger(write to extension data dir) will be used if nil.
@@ -125,10 +124,6 @@ func buildExtension(ctx context.Context, o Options) (*Extension, *telegram.Clien
 
 	// save logger to context
 	ctx = logctx.With(ctx, o.Logger)
-
-	if o.Middlewares == nil {
-		o.Middlewares = tclient.NewDefaultMiddlewares(ctx, 0)
-	}
 
 	client, err := buildClient(ctx, env, o)
 	if err != nil {

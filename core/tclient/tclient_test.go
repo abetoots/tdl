@@ -4,7 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
+	"net"
 	"strings"
 	"testing"
 	"testing/synctest"
@@ -12,157 +12,198 @@ import (
 
 	"github.com/gotd/td/bin"
 	"github.com/gotd/td/telegram"
-	"github.com/gotd/td/telegram/downloader"
 	"github.com/gotd/td/tg"
 	"github.com/gotd/td/tgerr"
 )
 
 const (
-	rpcCallFail = "RPC_CALL_FAIL"
-	floodWait5  = "FLOOD_WAIT_5"
+	rpcCallFail     = "RPC_CALL_FAIL"
+	floodWait5      = "FLOOD_WAIT_5"
+	reconnectBudget = 5 * time.Minute
 )
 
-func withDefaultMiddlewares(ctx context.Context, next tg.Invoker) tg.Invoker {
-	chain := NewDefaultMiddlewares(ctx, 5*time.Minute)
+func withDefaultMiddlewares(ctx context.Context, timeout time.Duration, next tg.Invoker) tg.Invoker {
+	chain := NewDefaultMiddlewares(ctx, timeout)
 	for i := len(chain) - 1; i >= 0; i-- {
 		next = chain[i].Handle(next)
 	}
 	return next
 }
 
-func TestDefaultMiddlewaresRPCFailure(t *testing.T) {
-	synctest.Test(t, func(t *testing.T) {
-		ctx := t.Context()
-		next := telegram.InvokeFunc(func(context.Context, bin.Encoder, bin.Decoder) error {
-			return tgerr.New(500, rpcCallFail)
-		})
-		start := time.Now()
+type chainReply func(context.Context, int, time.Time) error
 
-		err := withDefaultMiddlewares(ctx, next).Invoke(ctx, nil, nil)
-		if !tgerr.Is(err, rpcCallFail) {
-			t.Errorf("Invoke error = %v, want %s", err, rpcCallFail)
+func failForCalls(err error, failures int, finishAt time.Duration) chainReply {
+	return func(_ context.Context, call int, start time.Time) error {
+		if call <= failures {
+			return err
 		}
-		if elapsed := time.Since(start); elapsed != time.Minute {
-			t.Errorf("Invoke took %v, want 1m", elapsed)
-		}
-	})
+		time.Sleep(time.Until(start.Add(finishAt)))
+		return nil
+	}
 }
 
-func TestDefaultMiddlewaresFloodWait(t *testing.T) {
-	synctest.Test(t, func(t *testing.T) {
-		ctx, cancel := context.WithTimeout(t.Context(), 2*time.Minute)
-		defer cancel()
-
-		calls := 0
-		next := telegram.InvokeFunc(func(context.Context, bin.Encoder, bin.Decoder) error {
-			calls++
-			return tgerr.New(420, floodWait5)
-		})
-		start := time.Now()
-
-		err := withDefaultMiddlewares(ctx, next).Invoke(ctx, &tg.UploadGetFileRequest{}, &tg.UploadFileBox{})
-		if _, ok := tgerr.AsFloodWait(err); ok {
-			t.Errorf("Invoke error = %v, still matches a flood wait", err)
+func failAt(err error, delayedCall int, finishAt time.Duration) chainReply {
+	return func(_ context.Context, call int, start time.Time) error {
+		if call == delayedCall {
+			time.Sleep(time.Until(start.Add(finishAt)))
 		}
-		if err == nil || !strings.Contains(err.Error(), tgerr.ErrFloodWait) {
-			t.Errorf("Invoke error = %v, want %s", err, tgerr.ErrFloodWait)
-		}
-		if calls != 11 {
-			t.Errorf("Invoke made %d attempts, want 11", calls)
-		}
-		if elapsed := time.Since(start); elapsed != 50*time.Second {
-			t.Errorf("Invoke took %v, want 50s", elapsed)
-		}
-	})
+		return err
+	}
 }
 
-func TestDefaultMiddlewaresWaitsForMessages(t *testing.T) {
-	synctest.Test(t, func(t *testing.T) {
-		ctx := t.Context()
-		calls := 0
-		next := telegram.InvokeFunc(func(context.Context, bin.Encoder, bin.Decoder) error {
-			calls++
-			if calls <= 12 {
-				return tgerr.New(420, floodWait5)
-			}
-			return nil
-		})
-		start := time.Now()
-
-		if err := withDefaultMiddlewares(ctx, next).Invoke(ctx, &tg.ChannelsGetMessagesRequest{}, &tg.MessagesMessagesBox{}); err != nil {
-			t.Errorf("Invoke error = %v, want nil", err)
-		}
-		if calls != 13 {
-			t.Errorf("Invoke made %d attempts, want 13", calls)
-		}
-		if elapsed := time.Since(start); elapsed != time.Minute {
-			t.Errorf("Invoke took %v, want 1m", elapsed)
-		}
-	})
+type chainCase struct {
+	name           string
+	chunk          bool
+	unlimited      bool
+	failure        error
+	reply          chainReply
+	cancelAt       time.Duration
+	wantCalls      int
+	wantElapsed    time.Duration
+	wantRPC        string
+	wantText       string
+	wantCanceled   bool
+	wantDeadline   bool
+	wantNetTimeout bool
 }
 
-func TestDefaultMiddlewaresRecoversTransport(t *testing.T) {
-	synctest.Test(t, func(t *testing.T) {
-		ctx := t.Context()
-		calls := 0
-		transportErr := errors.New("connection lost")
-		next := telegram.InvokeFunc(func(context.Context, bin.Encoder, bin.Decoder) error {
-			calls++
-			if calls < 3 {
-				return transportErr
-			}
-			return nil
-		})
+func TestDefaultMiddlewaresErrorContract(t *testing.T) {
+	rpcErr := tgerr.New(500, rpcCallFail)
+	floodErr := tgerr.New(420, floodWait5)
+	premiumErr := tgerr.New(420, "FLOOD_PREMIUM_WAIT_5")
+	const layerInvalid = "CONNECTION_LAYER_INVALID"
+	layerErr := tgerr.New(400, layerInvalid)
+	deadlineErr := fmt.Errorf("transport request expired: %w", context.DeadlineExceeded)
+	netTimeout := &net.DNSError{Err: "transport timed out", IsTimeout: true}
+	transportErr := errors.New("connection lost")
+	cases := []chainCase{
+		{name: "chunk ordinary flood", chunk: true, failure: floodErr, wantCalls: 11, wantElapsed: 50 * time.Second, wantText: floodErr.Error()},
+		{name: "other ordinary flood", reply: failForCalls(floodErr, 12, time.Minute), wantCalls: 13, wantElapsed: time.Minute},
+		{name: "chunk premium flood", chunk: true, reply: failForCalls(premiumErr, 12, time.Minute), wantCalls: 13, wantElapsed: time.Minute},
+		{name: "other premium flood", reply: failForCalls(premiumErr, 12, time.Minute), wantCalls: 13, wantElapsed: time.Minute},
+		{name: "chunk Telegram 400", chunk: true, failure: layerErr, wantCalls: 1, wantRPC: layerInvalid, wantText: layerErr.Error()},
+		{name: "other Telegram 400", failure: layerErr, wantCalls: 1, wantRPC: layerInvalid, wantText: layerErr.Error()},
+		{name: "chunk transport deadline", chunk: true, reply: failAt(deadlineErr, 2, reconnectBudget), wantCalls: 2, wantElapsed: reconnectBudget, wantText: deadlineErr.Error()},
+		{name: "other transport deadline", reply: failAt(deadlineErr, 2, reconnectBudget), wantCalls: 2, wantElapsed: reconnectBudget, wantText: deadlineErr.Error(), wantDeadline: true, wantNetTimeout: true},
+		{name: "chunk net timeout", chunk: true, reply: failAt(netTimeout, 2, reconnectBudget), wantCalls: 2, wantElapsed: reconnectBudget, wantText: netTimeout.Error()},
+		{name: "other net timeout", reply: failAt(netTimeout, 2, reconnectBudget), wantCalls: 2, wantElapsed: reconnectBudget, wantText: netTimeout.Error(), wantNetTimeout: true},
+		{name: "chunk non-timeout transport", chunk: true, reply: failAt(transportErr, 2, reconnectBudget), wantCalls: 2, wantElapsed: reconnectBudget, wantText: transportErr.Error()},
+		{name: "other transport recovery", reply: failForCalls(transportErr, 2, 2*time.Second), wantCalls: 3, wantElapsed: 2 * time.Second},
+		{name: "chunk RPC with unlimited recovery", chunk: true, unlimited: true, failure: rpcErr, wantCalls: 5, wantElapsed: time.Minute, wantRPC: rpcCallFail, wantText: rpcErr.Error()},
+		{name: "other RPC with unlimited recovery", unlimited: true, failure: rpcErr, cancelAt: 70 * time.Second, wantCalls: 7, wantElapsed: 70 * time.Second, wantText: context.Canceled.Error(), wantCanceled: true},
+		{
+			name: "other RPC recovers after 70s",
+			reply: func(_ context.Context, _ int, start time.Time) error {
+				if time.Since(start) < 70*time.Second {
+					return rpcErr
+				}
+				// finish at a fixed time after the jittered eighth attempt starts.
+				time.Sleep(time.Until(start.Add(73 * time.Second)))
+				return nil
+			},
+			wantCalls: 8, wantElapsed: 73 * time.Second,
+		},
+		{name: "chunk cancel during retry", chunk: true, failure: rpcErr, cancelAt: time.Second, wantCalls: 1, wantElapsed: time.Second, wantText: context.Canceled.Error(), wantCanceled: true},
+		{name: "other cancel during flood", failure: floodErr, cancelAt: time.Second, wantCalls: 1, wantElapsed: time.Second, wantText: context.Canceled.Error(), wantCanceled: true},
+		{
+			name:  "chunk canceled transport",
+			chunk: true,
+			reply: func(ctx context.Context, _ int, _ time.Time) error {
+				<-ctx.Done()
+				return deadlineErr
+			},
+			cancelAt: time.Second, wantCalls: 1, wantElapsed: time.Second, wantText: context.Canceled.Error(), wantCanceled: true,
+		},
+	}
 
-		if err := withDefaultMiddlewares(ctx, next).Invoke(ctx, nil, nil); err != nil {
-			t.Errorf("Invoke error = %v, want nil", err)
+	for _, typ := range []string{
+		"Timedout",
+		"No workers running",
+		rpcCallFail,
+		"RPC_MCGET_FAIL",
+		"WORKER_BUSY_TOO_LONG_RETRY",
+		"memory limit exit",
+		tg.ErrTimeout,
+	} {
+		err := tgerr.New(500, typ)
+		wantRPC := typ
+		if typ == tg.ErrTimeout {
+			wantRPC = ""
 		}
-		if calls != 3 {
-			t.Errorf("Invoke made %d attempts, want 3", calls)
-		}
-	})
-}
+		cases = append(cases,
+			chainCase{name: "chunk " + typ, chunk: true, failure: err, wantCalls: 5, wantElapsed: time.Minute, wantRPC: wantRPC, wantText: err.Error()},
+			// start the second retry batch at 4m regardless of recovery jitter.
+			chainCase{name: "other " + typ, reply: failAt(err, 6, 4*time.Minute), wantCalls: 10, wantElapsed: reconnectBudget, wantText: err.Error()},
+		)
+	}
 
-func TestDefaultMiddlewaresDownloadRefusedChunk(t *testing.T) {
-	for _, refusal := range []*tgerr.Error{tgerr.New(420, floodWait5), tgerr.New(500, rpcCallFail)} {
-		t.Run(refusal.Message, func(t *testing.T) {
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
 			synctest.Test(t, func(t *testing.T) {
-				const partSize = 1 << 20
-				ctx, cancel := context.WithTimeout(t.Context(), 2*time.Minute)
+				parent, cancelParent := context.WithTimeout(t.Context(), 6*time.Minute)
+				defer cancelParent()
+				ctx, cancel := context.WithCancel(parent)
 				defer cancel()
+				if tt.cancelAt != 0 {
+					timer := time.NewTimer(tt.cancelAt)
+					defer timer.Stop()
+					go func() {
+						select {
+						case <-timer.C:
+							cancel()
+						case <-ctx.Done():
+						}
+					}()
+				}
 
-				part := make([]byte, partSize)
-				goodParts := 0
-				next := telegram.InvokeFunc(func(ctx context.Context, input bin.Encoder, output bin.Decoder) error {
-					if err := ctx.Err(); err != nil {
-						return err
+				var input bin.Encoder = &tg.ChannelsGetMessagesRequest{}
+				var output bin.Decoder = &tg.MessagesMessagesBox{}
+				if tt.chunk {
+					input, output = &tg.UploadGetFileRequest{}, &tg.UploadFileBox{}
+				}
+				timeout := reconnectBudget
+				if tt.unlimited {
+					timeout = 0
+				}
+				calls := 0
+				start := time.Now()
+				next := telegram.InvokeFunc(func(ctx context.Context, _ bin.Encoder, _ bin.Decoder) error {
+					calls++
+					if tt.reply != nil {
+						return tt.reply(ctx, calls, start)
 					}
-					req, ok := input.(*tg.UploadGetFileRequest)
-					if !ok {
-						return fmt.Errorf("unexpected request %T", input)
-					}
-					if req.Offset == 3*partSize {
-						return refusal
-					}
-					if req.Offset != int64(goodParts)*partSize || goodParts >= 3 || req.Limit != partSize {
-						return fmt.Errorf("unexpected file part at offset %d with limit %d", req.Offset, req.Limit)
-					}
-					goodParts++
-					output.(*tg.UploadFileBox).File = &tg.UploadFile{Type: &tg.StorageFileUnknown{}, Bytes: part}
-					return nil
+					return tt.failure
 				})
-				rpc := tg.NewClient(withDefaultMiddlewares(t.Context(), next))
-				loc := &tg.InputDocumentFileLocation{ID: 1}
-				_, err := downloader.NewDownloader().WithPartSize(partSize).Download(rpc, loc).Stream(ctx, io.Discard)
+				err := withDefaultMiddlewares(t.Context(), timeout, next).Invoke(ctx, input, output)
 
-				if goodParts != 3 {
-					t.Errorf("download got %d good parts, want 3", goodParts)
+				if calls != tt.wantCalls {
+					t.Errorf("Invoke made %d calls, want %d", calls, tt.wantCalls)
 				}
-				if ctx.Err() != nil {
-					t.Errorf("download reached its deadline: %v", err)
+				if elapsed := time.Since(start); elapsed != tt.wantElapsed {
+					t.Errorf("Invoke took %v, want %v", elapsed, tt.wantElapsed)
 				}
-				if err == nil || !strings.Contains(err.Error(), refusal.Type) {
-					t.Errorf("download error = %v, want %s", err, refusal.Type)
+				if tt.wantText == "" {
+					if err != nil {
+						t.Errorf("Invoke error = %v, want nil", err)
+					}
+				} else if err == nil || !strings.Contains(err.Error(), tt.wantText) {
+					t.Errorf("Invoke error = %v, want text %q", err, tt.wantText)
+				}
+				if _, ok := tgerr.As(err); ok != (tt.wantRPC != "") || tt.wantRPC != "" && !tgerr.Is(err, tt.wantRPC) {
+					t.Errorf("Invoke error = %v, want Telegram type %q", err, tt.wantRPC)
+				}
+				if _, ok := tgerr.AsFloodWait(err); ok {
+					t.Errorf("Invoke returned a retryable flood wait: %v", err)
+				}
+				if got := errors.Is(err, context.Canceled); got != tt.wantCanceled {
+					t.Errorf("Invoke error = %v, matches cancellation = %t, want %t", err, got, tt.wantCanceled)
+				}
+				if got := errors.Is(err, context.DeadlineExceeded); got != tt.wantDeadline {
+					t.Errorf("Invoke error = %v, matches deadline exceeded = %t, want %t", err, got, tt.wantDeadline)
+				}
+				var netErr net.Error
+				if got := errors.As(err, &netErr) && netErr.Timeout(); got != tt.wantNetTimeout {
+					t.Errorf("Invoke error = %v, matches net timeout = %t, want %t", err, got, tt.wantNetTimeout)
 				}
 			})
 		})
