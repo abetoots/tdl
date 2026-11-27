@@ -32,6 +32,33 @@ func withDefaultMiddlewares(ctx context.Context, timeout time.Duration, next tg.
 	return next
 }
 
+func TestClientMiddlewaresApplyDefaultsOnce(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(t.Context(), 2*time.Minute)
+		defer cancel()
+		calls := 0
+		var invoker tg.Invoker = telegram.InvokeFunc(func(context.Context, bin.Encoder, bin.Decoder) error {
+			calls++
+			return tgerr.New(420, floodWait5)
+		})
+		chain := clientMiddlewares(ctx, Options{})
+		if len(chain) != 3 {
+			t.Errorf("middleware count = %d, want 3 defaults", len(chain))
+		}
+		for i := len(chain) - 1; i >= 0; i-- {
+			invoker = chain[i].Handle(invoker)
+		}
+
+		err := invoker.Invoke(ctx, &tg.UploadGetFileRequest{}, &tg.UploadFileBox{})
+		if calls != 11 {
+			t.Errorf("Invoke made %d calls, want 11", calls)
+		}
+		if _, isFlood := tgerr.AsFloodWait(err); isFlood || err == nil || !strings.Contains(err.Error(), tgerr.ErrFloodWait) {
+			t.Errorf("Invoke error = %v, want an opaque flood-limit error", err)
+		}
+	})
+}
+
 type chainReply func(context.Context, int, time.Time) error
 
 func failForCalls(err error, failures int, finishAt time.Duration) chainReply {

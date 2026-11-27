@@ -3,6 +3,7 @@ package tclient
 import (
 	"context"
 	"fmt"
+	"sync/atomic"
 	"time"
 
 	"github.com/cenkalti/backoff/v4"
@@ -11,6 +12,7 @@ import (
 	tdclock "github.com/gotd/td/clock"
 	"github.com/gotd/td/exchange"
 	"github.com/gotd/td/telegram"
+	"github.com/gotd/td/telegram/auth"
 	"github.com/gotd/td/telegram/dcs"
 	"golang.org/x/net/proxy"
 
@@ -79,12 +81,16 @@ func New(ctx context.Context, o Options) (*telegram.Client, error) {
 		RetryInterval:  5 * time.Second,
 		MaxRetries:     5,
 		DialTimeout:    10 * time.Second,
-		Middlewares:    append(NewDefaultMiddlewares(ctx, o.ReconnectTimeout), o.Middlewares...),
+		Middlewares:    clientMiddlewares(ctx, o),
 		Clock:          tclock,
 		Logger:         logctx.From(ctx).Named("td"),
 	}
 
 	return telegram.NewClient(o.AppID, o.AppHash, opts), nil
+}
+
+func clientMiddlewares(ctx context.Context, o Options) []telegram.Middleware {
+	return append(NewDefaultMiddlewares(ctx, o.ReconnectTimeout), o.Middlewares...)
 }
 
 func NewDefaultMiddlewares(ctx context.Context, timeout time.Duration) []telegram.Middleware {
@@ -106,24 +112,42 @@ func newBackoff(timeout time.Duration) backoff.BackOff {
 }
 
 func RunWithAuth(ctx context.Context, client *telegram.Client, f func(ctx context.Context) error) error {
-	// gotd can cancel the callback context when the connection dies.
-	err := client.Run(ctx, func(runCtx context.Context) error {
-		status, err := client.Auth().Status(runCtx)
+	return runWithAuth(ctx, client.Run, client.Auth(), f)
+}
+
+type statusChecker interface {
+	Status(context.Context) (*auth.Status, error)
+}
+
+func runWithAuth(ctx context.Context, run func(context.Context, func(context.Context) error) error, checker statusChecker, f func(context.Context) error) error {
+	type callbackResult struct{ err error }
+	var completed atomic.Pointer[callbackResult]
+	err := run(ctx, func(runCtx context.Context) (rerr error) {
+		defer func() {
+			// gotd can cancel the callback context when the connection dies.
+			rerr = tutil.ConnectionLost(ctx, rerr)
+			completed.Store(&callbackResult{err: rerr})
+		}()
+
+		status, err := checker.Status(runCtx)
 		if err != nil {
-			return normalizeRunError(ctx, err)
+			return err
 		}
 		if !status.Authorized {
 			return fmt.Errorf("not authorized. please login first")
 		}
 
-		return normalizeRunError(ctx, f(runCtx))
+		return f(runCtx)
 	})
-	return normalizeRunError(ctx, err)
-}
-
-func normalizeRunError(ctx context.Context, err error) error {
-	if ctx.Err() == nil && errors.Is(err, context.Canceled) {
-		return fmt.Errorf("connection lost: %v", err)
+	if err != nil {
+		return tutil.ConnectionLost(ctx, err)
 	}
-	return err
+	if ctx.Err() != nil {
+		// preserve gotd's quiet exit on caller cancellation.
+		return nil
+	}
+	if result := completed.Load(); result != nil {
+		return result.err
+	}
+	return errors.New("connection lost: client stopped before the command finished")
 }

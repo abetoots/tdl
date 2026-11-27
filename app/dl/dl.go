@@ -19,6 +19,7 @@ import (
 	"github.com/iyear/tdl/core/logctx"
 	"github.com/iyear/tdl/core/storage"
 	"github.com/iyear/tdl/core/tclient"
+	"github.com/iyear/tdl/core/util/tutil"
 	"github.com/iyear/tdl/pkg/consts"
 	"github.com/iyear/tdl/pkg/key"
 	"github.com/iyear/tdl/pkg/prog"
@@ -144,12 +145,7 @@ func runDownload(ctx context.Context, d *downloader.Downloader, p *progress, lim
 	if ctxErr := ctx.Err(); ctxErr != nil {
 		return ctxErr
 	}
-	err = multierr.Combine(err, p.err())
-	// gotd's Client.Run exits 0 on any error matching context.Canceled
-	if errors.Is(err, context.Canceled) {
-		return errors.Errorf("connection lost: %v", err)
-	}
-	return err
+	return tutil.ConnectionLost(ctx, multierr.Combine(err, p.err()))
 }
 
 func finishResume(ctx context.Context, kvd storage.Storage, it *iter, rerr error) error {

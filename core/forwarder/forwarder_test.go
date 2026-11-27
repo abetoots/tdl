@@ -69,17 +69,22 @@ func (p *forwardTestProgress) OnDone(e Elem, err error) {
 func (*forwardTestProgress) OnClone(Elem, ProgressState) {}
 
 func TestForwardMessageFailure(t *testing.T) {
+	plain := errors.New("request failed")
 	for _, tt := range []struct {
-		name     string
-		canceled bool
-		grouped  bool
-		failure  error
+		name         string
+		canceled     bool
+		grouped      bool
+		albumForward bool
+		failure      error
 	}{
 		{name: "album lookup failure", grouped: true, failure: errors.New("album history unavailable")},
 		{name: "album connection lost", grouped: true, failure: fmt.Errorf("album history RPC: %w", context.Canceled)},
 		{name: "album canceled by caller", grouped: true, canceled: true, failure: context.Canceled},
+		{name: "caller cancels during plain album lookup failure", grouped: true, canceled: true, failure: plain},
+		{name: "caller cancels during plain album forward failure", grouped: true, albumForward: true, canceled: true, failure: plain},
 		{name: "single message connection lost", failure: fmt.Errorf("send message RPC: %w", context.Canceled)},
 		{name: "single message canceled by caller", canceled: true, failure: context.Canceled},
+		{name: "caller cancels during plain single message failure", canceled: true, failure: plain},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			ctx, cancel := context.WithCancel(t.Context())
@@ -92,12 +97,45 @@ func TestForwardMessageFailure(t *testing.T) {
 				}
 				return tt.failure
 			}
+			first := forwardTestElem{msg: &tg.Message{ID: 100, Message: "first"}, grouped: tt.grouped}
+			if tt.grouped {
+				first.msg.SetGroupedID(10)
+			}
+			if !tt.grouped || tt.albumForward {
+				first.mode = ModeClone
+			}
+			var album []tg.MessageClass
+			if tt.albumForward {
+				peer := &tg.PeerUser{UserID: 1}
+				first.msg.PeerID = peer
+				first.msg.SetMedia(&tg.MessageMediaDocument{Document: &tg.Document{ID: 1, Size: 10}})
+				previous := &tg.Message{ID: first.msg.ID - 1, PeerID: peer}
+				previous.SetGroupedID(10)
+				previous.SetMedia(&tg.MessageMediaDocument{Document: &tg.Document{ID: 2, Size: 10}})
+				album = []tg.MessageClass{first.msg, previous}
+			}
 			var forwarded []int
-			next := telegram.InvokeFunc(func(_ context.Context, input bin.Encoder, _ bin.Decoder) error {
+			next := telegram.InvokeFunc(func(_ context.Context, input bin.Encoder, output bin.Decoder) error {
 				switch req := input.(type) {
 				case *tg.MessagesGetHistoryRequest:
-					return fail()
+					if !tt.albumForward {
+						return fail()
+					}
+					result := &tg.MessagesMessages{}
+					if req.OffsetID > first.msg.ID {
+						result.Messages = album
+					}
+					output.(*tg.MessagesMessagesBox).Messages = result
+					return nil
 				case *tg.MessagesSendMessageRequest:
+					if tt.albumForward {
+						t.Error("sent a single message, want an album")
+					}
+					return fail()
+				case *tg.MessagesSendMultiMediaRequest:
+					if !tt.albumForward || len(req.MultiMedia) != len(album) {
+						t.Errorf("sent %d media items, want a two-item album", len(req.MultiMedia))
+					}
 					return fail()
 				case *tg.MessagesForwardMessagesRequest:
 					forwarded = append(forwarded, req.ID...)
@@ -109,13 +147,7 @@ func TestForwardMessageFailure(t *testing.T) {
 			client := tg.NewClient(next)
 			manager := (peers.Options{}).Build(client)
 			from, to := manager.User(&tg.User{ID: 1}), manager.User(&tg.User{ID: 2})
-			first := forwardTestElem{from: from, to: to, msg: &tg.Message{ID: 100, Message: "first"}}
-			if tt.grouped {
-				first.grouped = true
-				first.msg.SetGroupedID(10)
-			} else {
-				first.mode = ModeClone
-			}
+			first.from, first.to = from, to
 			second := &tg.Message{ID: 101}
 			it := &forwardTestIter{elems: []Elem{
 				first,
