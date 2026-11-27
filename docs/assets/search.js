@@ -1,4 +1,4 @@
-{{/* fork: hugo-book (3f1bcccbfb24) assets/search.js with Permalink, because canonifyURLs leaves RelPermalink without the /tdl/ base path here; re-copy when hugo-book is bumped */}}
+{{/* fork: hugo-book (3f1bcccbfb24) assets/search.js with Permalink, because canonifyURLs leaves RelPermalink without the /tdl/ base path here, and a no-results line; re-copy when hugo-book is bumped */}}
 'use strict';
 
 {{ $searchDataFile := printf "%s.search-data.json" .Language.Lang }}
@@ -91,6 +91,13 @@
 
       results.appendChild(li);
     });
+
+    // fork: say so when nothing matches, instead of an empty list
+    if (!searchHits.length) {
+      const li = element('<li><small></small></li>');
+      li.querySelector('small').textContent = {{ i18n "bookSearchNoResults" | default "No results" | jsonify }};
+      results.appendChild(li);
+    }
   }
 
   /**

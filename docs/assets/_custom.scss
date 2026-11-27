@@ -40,10 +40,19 @@
   opacity: .8;
 }
 
-// fork: the theme's dark link colour is below AA on hint backgrounds
+// fork: search result section labels; the theme's .5 opacity is below AA
+.book-search small {
+  opacity: .8;
+}
+
+// fork: on dark hint backgrounds the theme's link colour and code chips are below AA
 @media (prefers-color-scheme: dark) {
   .markdown .book-hint a,
   .markdown .book-hint a:visited {
     color: #a6c8ff;
+  }
+
+  .markdown .book-hint code {
+    background: rgba(0, 0, 0, .2);
   }
 }
