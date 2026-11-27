@@ -18,6 +18,7 @@ Template syntax is based on [Go's text/template](https://golang.org/pkg/text/tem
 |:--------------:|:----------------------------------------:|
 |   `DialogID`   |            Telegram dialog id            |
 |   `TopicID`    |  Topic ID (`1` General, `0` non-forum)   |
+|  `TopicTitle`  | Forum topic title, empty outside forums  |
 |  `MessageID`   |           Telegram message id            |
 | `MessageDate`  |     Telegram message date(timestamp)     |
 |   `FileName`   |            Telegram file name            |
@@ -60,6 +61,14 @@ Use the topic ID as the first path component to download a forum export into one
 ```sh
 tdl dl -f whole-group.json -t '{{ .TopicID }}/{{ .DialogID }}_{{ .MessageID }}_{{ filenamify .FileName }}'
 ```
+
+Include the topic title in each folder name.
+
+```sh
+tdl dl -f whole-group.json -t '{{ .TopicID }} {{ filenamify .TopicTitle }}/{{ .DialogID }}_{{ .MessageID }}_{{ filenamify .FileName }}'
+```
+
+Renaming a topic changes its folder name. A later run with `--skip-same` will miss files saved under the old name. Use `{{ .TopicID }}` alone for stable folder names.
 
 ### Default:
 

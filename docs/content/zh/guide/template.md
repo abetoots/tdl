@@ -18,6 +18,7 @@ bookToC: false
 |:--------------:|:---------------------:|
 |   `DialogID`   |     Telegram 对话ID     |
 |   `TopicID`    | 话题 ID（`1` 常规，`0` 非论坛） |
+|  `TopicTitle`  |     论坛话题标题（非论坛为空）     |
 |  `MessageID`   |     Telegram 消息ID     |
 | `MessageDate`  |  Telegram 消息日期（时间戳）   |
 |   `FileName`   |     Telegram 文件名      |
@@ -60,6 +61,14 @@ bookToC: false
 ```sh
 tdl dl -f whole-group.json -t '{{ .TopicID }}/{{ .DialogID }}_{{ .MessageID }}_{{ filenamify .FileName }}'
 ```
+
+也可以在文件夹名称中加入话题标题。
+
+```sh
+tdl dl -f whole-group.json -t '{{ .TopicID }} {{ filenamify .TopicTitle }}/{{ .DialogID }}_{{ .MessageID }}_{{ filenamify .FileName }}'
+```
+
+重命名话题会改变文件夹名称。之后使用 `--skip-same` 下载时，将找不到保存在旧文件夹中的文件。若要保持文件夹名称稳定，请仅使用 `{{ .TopicID }}`。
 
 ### 默认：
 
