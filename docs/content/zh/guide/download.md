@@ -113,6 +113,10 @@ tdl dl -u https://t.me/tdl/1 --skip-same
 tdl dl -u https://t.me/tdl/1 --takeout
 {{< /command >}}
 
+{{< hint info >}}
+如果 Telegram 无法启动 "Takeout" 会话，tdl 会在日志文件中记录 `takeout error`，然后不使用该会话继续下载。
+{{< /hint >}}
+
 ## 过滤器
 
 使用扩展名过滤器下载文件：
@@ -146,6 +150,27 @@ tdl dl -u https://t.me/tdl/1 \
 --template "{{ .DialogID }}_{{ .MessageID }}_{{ .DownloadDate }}_{{ .FileName }}"
 {{< /command >}}
 
+## 带话题的群组
+
+将带话题的群组按话题下载到各自的文件夹：先导出整个群组，再用模板字段 `TopicID` 和 `TopicTitle` 命名文件夹。
+
+{{< command >}}
+tdl chat export -c CHAT -o group.json
+tdl dl -f group.json \
+--template "{{ .TopicID }}{{ with .TopicTitle }} {{ filenamify . 60 }}{{ end }}/{{ .DialogID }}_{{ .MessageID }}_{{ filenamify .FileName }}"
+{{< /command >}}
+
+请将 `CHAT` 替换为群组的用户名或 ID。这会创建 `5 Releases`、`1 General` 这样的文件夹。没有话题的聊天中的文件会放进 `0`。两个字段的说明请参考 [模板指南](/zh/guide/template)。
+
+如果只想下载部分话题，请用 `--topic` 逐个导出，再把所有文件交给同一次下载。`tdl chat ls` 会列出每个群组的话题 ID。没有媒体的话题请不要加入：目前，没有任何消息的导出文件会让下载在处理它之后的文件之前就结束。
+
+{{< command >}}
+tdl chat export -c CHAT --topic 5 -o topic-5.json
+tdl chat export -c CHAT --topic 9 -o topic-9.json
+tdl dl -f topic-5.json -f topic-9.json \
+--template "{{ .TopicID }}{{ with .TopicTitle }} {{ filenamify . 60 }}{{ end }}/{{ .DialogID }}_{{ .MessageID }}_{{ filenamify .FileName }}"
+{{< /command >}}
+
 ## 恢复/重新开始下载
 
 在不需要交互的情况下恢复下载：
@@ -159,6 +184,15 @@ tdl dl -u https://t.me/tdl/1 --continue
 {{< command >}}
 tdl dl -u https://t.me/tdl/1 --restart
 {{< /command >}}
+
+## 下载失败
+
+下载失败的文件会显示 `failed!` 和原因，其他文件继续下载。结束时 tdl 会报告失败的文件数并以错误退出，下次使用 `--continue` 即可重试这些文件。
+
+- **Telegram 一直拒绝的文件**会失败，而不会卡住整个下载。对于一个文件分片，等待 10 次 `FLOOD_WAIT` 后，或遇到 `RPC_CALL_FAIL` 等 Telegram 内部错误时共尝试 5 次（退避约一分钟）后，tdl 会放弃。错误信息会显示 Telegram 给出的原因。
+- **`FLOOD_PREMIUM_WAIT`** 是 Telegram 对非 Premium 账户的限速，tdl 总会等待它结束。
+- **无法恢复的连接**算作失败，绝不会被当成下载完成。在此之前，tdl 会先重试该请求；请参阅 [`--reconnect-timeout`](/zh/guide/global-config#--reconnect-timeout)。
+- **Ctrl+C** 会停止下载并保存进度。之后 `--continue` 会跳过已完成的文件，并从头重新下载被中断的文件。
 
 ## HTTP 文件服务器
 

@@ -118,6 +118,10 @@ with [takeout session](https://arabic-telethon.readthedocs.io/en/stable/extra/ex
 tdl dl -u https://t.me/tdl/1 --takeout
 {{< /command >}}
 
+{{< hint info >}}
+If Telegram won't start a takeout session, tdl writes `takeout error` to its log file and downloads without one.
+{{< /hint >}}
+
 ## Filters
 
 Download files with extension filters:
@@ -151,6 +155,27 @@ tdl dl -u https://t.me/tdl/1 \
 --template "{{ .DialogID }}_{{ .MessageID }}_{{ .DownloadDate }}_{{ .FileName }}"
 {{< /command >}}
 
+## Groups with Topics
+
+Download a group with topics into one folder per topic: export the whole group once, then name the folder with the `TopicID` and `TopicTitle` template fields.
+
+{{< command >}}
+tdl chat export -c CHAT -o group.json
+tdl dl -f group.json \
+--template "{{ .TopicID }}{{ with .TopicTitle }} {{ filenamify . 60 }}{{ end }}/{{ .DialogID }}_{{ .MessageID }}_{{ filenamify .FileName }}"
+{{< /command >}}
+
+Replace `CHAT` with the group's username or ID. This creates folders like `5 Releases` and `1 General`. Files from chats without topics go into `0`. See the [Template Guide](/guide/template) for both fields.
+
+To download only some topics, export each one with `--topic`, then pass all the files to one run. `tdl chat ls` lists each group's topic IDs. Leave out the export of a topic with no media: an export with no messages currently ends the run before the files after it.
+
+{{< command >}}
+tdl chat export -c CHAT --topic 5 -o topic-5.json
+tdl chat export -c CHAT --topic 9 -o topic-9.json
+tdl dl -f topic-5.json -f topic-9.json \
+--template "{{ .TopicID }}{{ with .TopicTitle }} {{ filenamify . 60 }}{{ end }}/{{ .DialogID }}_{{ .MessageID }}_{{ filenamify .FileName }}"
+{{< /command >}}
+
 ## Resume/Restart
 
 Resume without UI interaction:
@@ -164,6 +189,15 @@ Restart without UI interaction:
 {{< command >}}
 tdl dl -u https://t.me/tdl/1 --restart
 {{< /command >}}
+
+## Failed Downloads
+
+A file that fails shows `failed!` with the reason, and the other files keep downloading. At the end, tdl reports how many files failed and exits with an error, so `--continue` retries them next time.
+
+- **A file Telegram keeps refusing** fails instead of stalling the run. tdl gives up on a file part after waiting out 10 `FLOOD_WAIT`s, or after 5 attempts in total, with about a minute of backoff, for Telegram internal errors such as `RPC_CALL_FAIL`. The error shows Telegram's reason.
+- **`FLOOD_PREMIUM_WAIT`**, Telegram's speed limit for accounts without Premium, is always waited out.
+- **A connection that can't be recovered** counts as a failure, never as a finished run. tdl retries the request first; see [`--reconnect-timeout`](/guide/global-config#--reconnect-timeout).
+- **Ctrl+C** stops the run and saves progress. `--continue` then skips the files that finished, and downloads interrupted files again from the start.
 
 ## Serve
 

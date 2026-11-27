@@ -4,6 +4,10 @@ title: 介绍
 
 # tdl
 
+{{< hint info >}}
+**这是 [iyear/tdl](https://github.com/iyear/tdl) 的一个分支。** 有哪些不同以及如何安装，请参阅 [关于此分支](/zh/fork)。
+{{< /hint >}}
+
 ![](https://img.shields.io/github/go-mod/go-version/iyear/tdl?style=flat-square)
 ![](https://img.shields.io/github/license/iyear/tdl?style=flat-square)
 ![](https://img.shields.io/github/actions/workflow/status/iyear/tdl/master.yml?branch=master&style=flat-square)
