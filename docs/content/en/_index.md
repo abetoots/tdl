@@ -4,6 +4,10 @@ title: Introduction
 
 # tdl
 
+{{< hint info >}}
+**This is a fork of [iyear/tdl](https://github.com/iyear/tdl).** See [About This Fork](/fork) for what's different and how to install it.
+{{< /hint >}}
+
 ![](https://img.shields.io/github/go-mod/go-version/iyear/tdl?style=flat-square)
 ![](https://img.shields.io/github/license/iyear/tdl?style=flat-square)
 ![](https://img.shields.io/github/actions/workflow/status/iyear/tdl/master.yml?branch=master&style=flat-square)

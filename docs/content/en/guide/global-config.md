@@ -65,10 +65,10 @@ tdl --ntp pool.ntp.org
 
 ## `--reconnect-timeout`
 
-Set Telegram client reconnect timeout. Default: `2m`.
+How long tdl's own retries go on for a request that keeps failing with a connection error or a Telegram internal error, and how long tdl keeps restoring its main connection, before it gives up. gotd can also retry a request on a fresh connection by itself, which this doesn't limit. `0` means it never gives up. Default: `5m`.
 
 {{< hint info >}}
-Set higher timeout or 0(INF) if your network is poor.
+Set a higher timeout or 0 (INF) if your network is poor. A file that Telegram keeps refusing fails sooner, whatever this is set to: see [Failed Downloads](/guide/download#failed-downloads).
 {{< /hint >}}
 
 {{< command >}}
