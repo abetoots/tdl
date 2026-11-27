@@ -12,6 +12,7 @@ import (
 	"github.com/gotd/td/tg"
 	"github.com/gotd/td/tgerr"
 
+	"github.com/iyear/tdl/core/middlewares/retry"
 	"github.com/iyear/tdl/core/util/tutil"
 )
 
@@ -27,7 +28,7 @@ func New(maxRetries uint) telegram.Middleware {
 			for {
 				err := next.Invoke(ctx, input, output)
 				if ctxErr := ctx.Err(); ctxErr != nil {
-					return ctxErr
+					return retry.WaitContextError(ctxErr, err)
 				}
 				delay, ok := tgerr.AsFloodWait(err)
 				if !ok {
@@ -58,8 +59,8 @@ func New(maxRetries uint) telegram.Middleware {
 				case <-ctx.Done():
 					timer.Stop()
 				}
-				if err := ctx.Err(); err != nil {
-					return err
+				if ctxErr := ctx.Err(); ctxErr != nil {
+					return retry.WaitContextError(ctxErr, err)
 				}
 			}
 		}

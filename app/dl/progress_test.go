@@ -119,6 +119,19 @@ func TestOnDoneSuccessClosesBar(t *testing.T) {
 	assert.NoFileExists(t, elem.to.Name())
 }
 
+func TestOnDoneKeepsLargestDownloadedCount(t *testing.T) {
+	p, _, elem, tracker := setupProgressTest(t, pw.NewWriter())
+	size := elem.file.Size
+	p.OnDownload(elem, downloader.ProgressState{Downloaded: size, Total: size})
+	p.OnDownload(elem, downloader.ProgressState{Downloaded: size / 2, Total: size})
+	require.False(t, tracker.IsDone())
+
+	p.OnDone(elem, nil)
+	assert.True(t, tracker.IsDone())
+	assert.Equal(t, size, tracker.Value())
+	assert.Equal(t, size, tracker.Total)
+}
+
 func TestOnDoneIgnoresDuplicate(t *testing.T) {
 	w := &logWriter{Writer: pw.NewWriter()}
 	p, _, elem, tracker := setupProgressTest(t, w)
@@ -247,14 +260,29 @@ func TestOnDoneChtimesFailureStillFinishes(t *testing.T) {
 	assert.NotContains(t, w.lines[0], " error: ")
 }
 
+type renderSignal chan struct{}
+
+func (r renderSignal) Write(p []byte) (int, error) {
+	select {
+	case r <- struct{}{}:
+	default:
+	}
+	return len(p), nil
+}
+
 func TestOnDoneCancelLetsProgressWaitReturn(t *testing.T) {
 	w := prog.New(utils.Byte.FormatBinaryBytes)
-	w.SetOutputWriter(io.Discard)
-	go w.Render()
-	t.Cleanup(w.Stop)
-	require.Eventually(t, w.IsRenderInProgress, 2*time.Second, time.Millisecond)
-
+	rendered := make(renderSignal, 1)
+	w.SetOutputWriter(rendered)
 	p, _, elem, _ := setupProgressTest(t, w)
+	go w.Render()
+	select {
+	case <-rendered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("progress did not render")
+	}
+	t.Cleanup(w.Stop)
+
 	p.OnDone(elem, fmt.Errorf("download: %w", context.Canceled))
 
 	done := make(chan struct{})

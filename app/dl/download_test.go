@@ -9,11 +9,13 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/gotd/td/bin"
 	"github.com/gotd/td/telegram"
 	"github.com/gotd/td/tg"
+	"github.com/gotd/td/tgerr"
 	pw "github.com/jedib0t/go-pretty/v6/progress"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -21,6 +23,7 @@ import (
 	"github.com/iyear/tdl/core/dcpool"
 	"github.com/iyear/tdl/core/downloader"
 	"github.com/iyear/tdl/core/storage"
+	"github.com/iyear/tdl/core/tclient"
 	"github.com/iyear/tdl/pkg/key"
 )
 
@@ -52,6 +55,8 @@ func (p downloadTestPool) Client(_ context.Context, dc int) *tg.Client {
 	}
 	return tg.NewClient(downloadTestInvoker{})
 }
+
+func (p downloadTestPool) Default(ctx context.Context) *tg.Client { return p.Client(ctx, 2) }
 
 type downloadTestInvoker struct{ err error }
 
@@ -145,6 +150,7 @@ func TestRunDownloadOutcomes(t *testing.T) {
 		invokers   map[int]tg.Invoker
 		iterErr    error
 		cancel     bool
+		flood      bool
 		wantErrors []string
 		wantLogs   []string
 		wantSaved  string
@@ -161,6 +167,14 @@ func TestRunDownloadOutcomes(t *testing.T) {
 			wantSaved:  `{"0":{}}`,
 		},
 		{name: "success", files: []string{"first.bin", "second.bin"}},
+		{
+			name:       "chunk flood cap",
+			files:      []string{"flood.bin", "sibling.bin"},
+			flood:      true,
+			wantErrors: []string{"1 file(s) failed to download"},
+			wantLogs:   []string{"flood.bin"},
+			wantSaved:  `{"1":{}}`,
+		},
 		{
 			name:       "post-transfer failure only",
 			files:      []string{collision},
@@ -184,8 +198,12 @@ func TestRunDownloadOutcomes(t *testing.T) {
 			wantSaved:  `{}`,
 		},
 	} {
-		t.Run(test.name, func(t *testing.T) {
-			ctx, cancelTimeout := context.WithTimeout(t.Context(), 5*time.Second)
+		run := func(t *testing.T) {
+			timeout := 5 * time.Second
+			if test.flood {
+				timeout = 2 * time.Minute
+			}
+			ctx, cancelTimeout := context.WithTimeout(t.Context(), timeout)
 			defer cancelTimeout()
 			kvd := resumeTestStorage{resumeKey: []byte(`{"9":{}}`)}
 			dir := t.TempDir()
@@ -205,13 +223,22 @@ func TestRunDownloadOutcomes(t *testing.T) {
 				}
 			}
 			pool := downloadTestPool{invokers: test.invokers}
+			if test.flood {
+				var invoker tg.Invoker = downloadTestInvoker{err: tgerr.New(420, "FLOOD_WAIT_5")}
+				middlewares := tclient.NewDefaultMiddlewares(ctx, 5*time.Minute)
+				for i := len(middlewares) - 1; i >= 0; i-- {
+					invoker = middlewares[i].Handle(invoker)
+				}
+				pool.invokers = map[int]tg.Invoker{2: invoker}
+			}
 			if test.cancel {
 				var cancel context.CancelFunc
 				ctx, cancel = context.WithCancel(ctx)
 				defer cancel()
 				blocked := make(chan struct{})
+				var blockOnce sync.Once
 				pool.invokers = map[int]tg.Invoker{4: telegram.InvokeFunc(func(ctx context.Context, _ bin.Encoder, _ bin.Decoder) error {
-					close(blocked)
+					blockOnce.Do(func() { close(blocked) })
 					<-ctx.Done()
 					return ctx.Err()
 				})}
@@ -250,6 +277,13 @@ func TestRunDownloadOutcomes(t *testing.T) {
 				}
 			}
 			require.Len(t, w.lines, len(test.wantLogs))
+			if test.flood {
+				assert.NoError(t, ctx.Err())
+				assert.Contains(t, w.lines[0], "FLOOD_WAIT (5)")
+				assert.Contains(t, it.Finished(), 1)
+				assert.NotContains(t, it.Finished(), 0)
+				assert.FileExists(t, filepath.Join(dir, "sibling.bin"))
+			}
 			for _, name := range test.wantLogs {
 				count := 0
 				for _, line := range w.lines {
@@ -266,6 +300,13 @@ func TestRunDownloadOutcomes(t *testing.T) {
 			} else {
 				require.NoError(t, getErr)
 				assert.JSONEq(t, test.wantSaved, string(saved))
+			}
+		}
+		t.Run(test.name, func(t *testing.T) {
+			if test.flood {
+				synctest.Test(t, run)
+			} else {
+				run(t)
 			}
 		})
 	}

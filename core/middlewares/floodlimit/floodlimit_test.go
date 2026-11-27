@@ -3,6 +3,7 @@ package floodlimit
 import (
 	"context"
 	"errors"
+	"net"
 	"strings"
 	"testing"
 	"testing/synctest"
@@ -148,8 +149,19 @@ func TestFloodLimitStopsWaitingAtDeadline(t *testing.T) {
 		})
 		start := time.Now()
 
-		if err := New(10).Handle(next)(ctx, &tg.UploadGetFileRequest{}, &tg.UploadFileBox{}); err != context.DeadlineExceeded {
-			t.Errorf("Invoke error = %v, want %v", err, context.DeadlineExceeded)
+		err := New(10).Handle(next)(ctx, &tg.UploadGetFileRequest{}, &tg.UploadFileBox{})
+		if !errors.Is(err, context.DeadlineExceeded) || !strings.Contains(err.Error(), tgerr.New(420, floodWait5).Error()) {
+			t.Errorf("Invoke error = %v, want %v with the last flood wait", err, context.DeadlineExceeded)
+		}
+		if _, ok := tgerr.As(err); ok {
+			t.Errorf("Invoke error = %v, still a Telegram error", err)
+		}
+		if _, ok := tgerr.AsFloodWait(err); ok {
+			t.Errorf("Invoke error = %v, still a flood wait", err)
+		}
+		var netErr net.Error
+		if errors.As(err, &netErr) {
+			t.Errorf("Invoke error = %v, still a network error", err)
 		}
 		if calls != 1 {
 			t.Errorf("Invoke made %d attempts, want 1", calls)

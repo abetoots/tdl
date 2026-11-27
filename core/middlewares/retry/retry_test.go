@@ -2,6 +2,8 @@ package retry
 
 import (
 	"context"
+	"errors"
+	"net"
 	"slices"
 	"strings"
 	"testing"
@@ -59,14 +61,48 @@ func TestRetryCancelsWait(t *testing.T) {
 		time.Sleep(time.Second)
 		cancel()
 
-		if err := <-result; err != ctx.Err() {
-			t.Errorf("Invoke error = %v, want %v", err, ctx.Err())
+		if err := <-result; !errors.Is(err, ctx.Err()) || !strings.Contains(err.Error(), rpcCallFail) {
+			t.Errorf("Invoke error = %v, want %v with %s", err, ctx.Err(), rpcCallFail)
 		}
 		if calls != 1 {
 			t.Errorf("Invoke made %d attempts, want 1", calls)
 		}
 		if elapsed := time.Since(start); elapsed != time.Second {
 			t.Errorf("Invoke took %v, want 1s", elapsed)
+		}
+	})
+}
+
+func TestRetryPreservesLastFailureAtDeadline(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+		defer cancel()
+		calls := 0
+		next := telegram.InvokeFunc(func(context.Context, bin.Encoder, bin.Decoder) error {
+			calls++
+			if calls == 1 {
+				return tgerr.New(500, rpcCallFail)
+			}
+			return tgerr.New(500, tg.ErrTimeout)
+		})
+		start := time.Now()
+		err := New(5).Handle(next)(ctx, &tg.UploadGetFileRequest{}, &tg.UploadFileBox{})
+		if !errors.Is(err, context.DeadlineExceeded) || !strings.Contains(err.Error(), tg.ErrTimeout) ||
+			strings.Contains(err.Error(), rpcCallFail) {
+			t.Errorf("Invoke error = %v, want deadline with the last Telegram error %s", err, tg.ErrTimeout)
+		}
+		if _, ok := tgerr.As(err); ok {
+			t.Errorf("Invoke error = %v, still a Telegram error", err)
+		}
+		if _, ok := tgerr.AsFloodWait(err); ok {
+			t.Errorf("Invoke error = %v, still a flood wait", err)
+		}
+		var netErr net.Error
+		if errors.As(err, &netErr) {
+			t.Errorf("Invoke error = %v, still a network error", err)
+		}
+		if elapsed := time.Since(start); calls != 2 || elapsed != 5*time.Second {
+			t.Errorf("Invoke made %d calls in %v, want 2 in 5s", calls, elapsed)
 		}
 	})
 }

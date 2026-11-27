@@ -32,6 +32,9 @@ type retry struct {
 
 func (r retry) Handle(next tg.Invoker) telegram.InvokeFunc {
 	return func(ctx context.Context, input bin.Encoder, output bin.Decoder) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		var lastErr error
 		delay := 4 * time.Second
 		for retries := 0; retries < r.max; retries++ {
@@ -43,12 +46,18 @@ func (r retry) Handle(next tg.Invoker) telegram.InvokeFunc {
 					timer.Stop()
 				}
 				if err := ctx.Err(); err != nil {
-					return err
+					return WaitContextError(err, lastErr)
 				}
 				delay *= 2
 			}
 
 			err := next.Invoke(ctx, input, output)
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				if _, ok := tgerr.As(err); ok {
+					lastErr = err
+				}
+				return WaitContextError(ctxErr, lastErr)
+			}
 			if err == nil {
 				return nil
 			}

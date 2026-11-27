@@ -2,12 +2,23 @@ package dl
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"strings"
 	"testing"
+	"testing/synctest"
 	"time"
 
+	"github.com/gotd/td/bin"
+	"github.com/gotd/td/telegram"
+	"github.com/gotd/td/telegram/peers"
+	"github.com/gotd/td/tg"
+	pw "github.com/jedib0t/go-pretty/v6/progress"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/iyear/tdl/core/downloader"
+	"github.com/iyear/tdl/pkg/tmessage"
 )
 
 // TestIterDeletedMessageHandling verifies that deleted messages are handled correctly
@@ -209,14 +220,92 @@ func BenchmarkDeletedMessageDetection(b *testing.B) {
 	}
 }
 
-// TestIterContextCancellation verifies that the iterator correctly handles
-// context cancellation even during deleted message handling
 func TestIterContextCancellation(t *testing.T) {
-	t.Run("context cancellation during deleted message handling", func(t *testing.T) {
-		ctx, cancel := context.WithTimeout(t.Context(), time.Millisecond)
-		defer cancel()
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	it := &iter{}
 
-		<-ctx.Done()
-		assert.ErrorIs(t, ctx.Err(), context.DeadlineExceeded)
-	})
+	assert.False(t, it.Next(ctx))
+	assert.ErrorIs(t, it.Err(), context.Canceled)
+}
+
+func TestIterGroupedLookupFailure(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		run  bool
+	}{
+		{name: "iterator returns lookup error"},
+		{name: "run joins earlier transfer", run: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				const userID = 42
+				ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+				defer cancel()
+				album := &tg.Message{ID: 20, PeerID: &tg.PeerUser{UserID: userID}}
+				album.SetGroupedID(1)
+				lookupErr := errors.New("album history unavailable")
+				lookupFailed := make(chan struct{})
+				historyCalls := 0
+				history := telegram.InvokeFunc(func(_ context.Context, input bin.Encoder, output bin.Decoder) error {
+					req, ok := input.(*tg.MessagesGetHistoryRequest)
+					if !ok {
+						return fmt.Errorf("unexpected request %T", input)
+					}
+					historyCalls++
+					if req.Limit == 1 {
+						output.(*tg.MessagesMessagesBox).Messages = &tg.MessagesMessages{
+							Messages: []tg.MessageClass{album},
+						}
+						return nil
+					}
+					if req.Limit == 20 {
+						close(lookupFailed)
+						return lookupErr
+					}
+					return fmt.Errorf("unexpected history limit %d", req.Limit)
+				})
+				pool := downloadTestPool{invokers: map[int]tg.Invoker{2: history}}
+				manager := (peers.Options{Cache: &peers.InmemoryCache{}}).Build(pool.Default(ctx))
+				require.NoError(t, manager.Apply(ctx, []tg.UserClass{&tg.User{ID: userID}}, nil))
+				it, err := newIter(pool, manager, [][]*tmessage.Dialog{{{
+					Peer: &tg.InputPeerUser{UserID: userID}, Messages: []int{album.ID},
+				}}}, Options{Group: true}, 0)
+				require.NoError(t, err)
+
+				failedPos := 0
+				if tt.run {
+					elem := newProgressTestElem(t, t.TempDir(), "earlier.bin")
+					elem.logicalPos = 0
+					elem.file.InputFileLoc = &tg.InputDocumentFileLocation{}
+					elem.file.Size = int64(len(downloadTestContent))
+					elem.file.DC = 3
+					it.elem <- elem
+					it.logicalPos = 1
+					failedPos = 1
+					pool.invokers[3] = telegram.InvokeFunc(func(ctx context.Context, input bin.Encoder, output bin.Decoder) error {
+						select {
+						case <-lookupFailed:
+						case <-ctx.Done():
+							return ctx.Err()
+						}
+						time.Sleep(time.Second)
+						return (downloadTestInvoker{}).Invoke(ctx, input, output)
+					})
+					p := newProgress(pw.NewWriter(), it, Options{})
+					d := downloader.New(downloader.Options{Pool: pool, Threads: 1, Iter: it, Progress: p})
+					err := runDownload(ctx, d, p, 1)
+					assert.ErrorIs(t, err, lookupErr)
+					assert.Contains(t, it.Finished(), elem.logicalPos)
+				} else {
+					assert.False(t, it.Next(ctx))
+				}
+
+				assert.Equal(t, 2, historyCalls)
+				assert.ErrorIs(t, it.Err(), lookupErr)
+				assert.ErrorContains(t, it.Err(), "resolve grouped message")
+				assert.NotContains(t, it.Finished(), failedPos)
+			})
+		})
+	}
 }
