@@ -32,7 +32,7 @@ It reaches my proxy's speed limit, and the **speed depends on whether you are a 
 
 ## Documentation
 
-Please refer to the [documentation](https://docs.iyear.me/tdl/).
+Please refer to the [documentation](https://abetoots.github.io/tdl/).
 
 ## Sponsors
 

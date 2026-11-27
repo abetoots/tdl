@@ -37,7 +37,7 @@
 
 ## 文档
 
-请参考 [文档](https://docs.iyear.me/tdl/zh/).
+请参考 [文档](https://abetoots.github.io/tdl/zh/).
 
 ## 赞助者
 
