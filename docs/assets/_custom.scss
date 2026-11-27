@@ -33,3 +33,17 @@
   opacity: 0;
   transition: opacity 0.3s ease-in-out;
 }
+
+// fork: the built-in search box's placeholder is its only label; the browser default is too faint in dark
+#book-search-input::placeholder {
+  color: var(--body-font-color);
+  opacity: .8;
+}
+
+// fork: the theme's dark link colour is below AA on hint backgrounds
+@media (prefers-color-scheme: dark) {
+  .markdown .book-hint a,
+  .markdown .book-hint a:visited {
+    color: #a6c8ff;
+  }
+}

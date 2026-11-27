@@ -31,6 +31,8 @@ languages:
   en:
     languageName: English
     contentDir: content/en
+    params:
+      contentDir: content/en # hugo-book's edit links read this
     weight: 1
     menu:
       before:
@@ -46,6 +48,8 @@ languages:
   zh:
     languageName: 简体中文
     contentDir: content/zh
+    params:
+      contentDir: content/zh # hugo-book's edit links read this
     weight: 2
     menu:
       before:
