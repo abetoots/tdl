@@ -5,6 +5,10 @@ weight: 10
 
 # Installation
 
+{{< hint warning >}}
+These instructions install upstream's releases, which don't include this fork's changes. To use the fork, [build it from source](/fork#installing).
+{{< /hint >}}
+
 ## One-Line Scripts
 
 {{< tabs "scripts" >}}
