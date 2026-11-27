@@ -61,6 +61,11 @@ func (f *Forwarder) Forward(ctx context.Context) error {
 		if _, ok := elem.Msg().GetGroupedID(); ok && elem.AsGrouped() {
 			grouped, err := tutil.GetGroupedMessages(ctx, f.opts.Pool.Default(ctx), elem.From().InputPeer(), elem.Msg())
 			if err != nil {
+				if errors.Is(err, context.Canceled) {
+					return err
+				}
+				f.opts.Progress.OnAdd(elem)
+				f.opts.Progress.OnDone(elem, errors.Wrapf(err, "resolve grouped message %d/%d", elem.From().ID(), elem.Msg().ID))
 				continue
 			}
 

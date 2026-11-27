@@ -53,7 +53,13 @@ func (p *progress) OnDownload(elem downloader.Elem, state downloader.ProgressSta
 		return
 	}
 
-	p.downloaded.Store(id, state.Downloaded)
+	previous, loaded := p.downloaded.LoadOrStore(id, state.Downloaded)
+	for loaded && previous.(int64) < state.Downloaded {
+		if p.downloaded.CompareAndSwap(id, previous, state.Downloaded) {
+			break
+		}
+		previous, loaded = p.downloaded.Load(id)
+	}
 	t := tracker.(*pw.Tracker)
 	t.UpdateTotal(state.Total)
 	value := state.Downloaded
