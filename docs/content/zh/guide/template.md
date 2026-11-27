@@ -17,6 +17,7 @@ bookToC: false
 |       变量       |          描述           |
 |:--------------:|:---------------------:|
 |   `DialogID`   |     Telegram 对话ID     |
+|   `TopicID`    | 话题 ID（`1` 常规，`0` 非论坛） |
 |  `MessageID`   |     Telegram 消息ID     |
 | `MessageDate`  |  Telegram 消息日期（时间戳）   |
 |   `FileName`   |     Telegram 文件名      |
@@ -52,6 +53,12 @@ bookToC: false
 {{ lower (replace .FileName ` ` `_`) }}
 
 {{ formatDate (now) }}
+```
+
+以下命令将论坛群组的导出文件按话题下载到各自的文件夹。
+
+```sh
+tdl dl -f whole-group.json -t '{{ .TopicID }}/{{ .DialogID }}_{{ .MessageID }}_{{ filenamify .FileName }}'
 ```
 
 ### 默认：
