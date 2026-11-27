@@ -17,6 +17,7 @@ Template syntax is based on [Go's text/template](https://golang.org/pkg/text/tem
 |      Var       |                   Desc                   |
 |:--------------:|:----------------------------------------:|
 |   `DialogID`   |            Telegram dialog id            |
+|   `TopicID`    |  Topic ID (`1` General, `0` non-forum)   |
 |  `MessageID`   |           Telegram message id            |
 | `MessageDate`  |     Telegram message date(timestamp)     |
 |   `FileName`   |            Telegram file name            |
@@ -52,6 +53,12 @@ Template syntax is based on [Go's text/template](https://golang.org/pkg/text/tem
 {{ lower (replace .FileName ` ` `_`) }}
 
 {{ formatDate (now) }}
+```
+
+Use the topic ID as the first path component to download a forum export into one folder per topic.
+
+```sh
+tdl dl -f whole-group.json -t '{{ .TopicID }}/{{ .DialogID }}_{{ .MessageID }}_{{ filenamify .FileName }}'
 ```
 
 ### Default:

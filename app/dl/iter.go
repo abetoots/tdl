@@ -36,6 +36,7 @@ const tempExt = ".tmp"
 
 type fileTemplate struct {
 	DialogID     int64
+	TopicID      int
 	MessageID    int
 	MessageDate  int64
 	FileName     string
@@ -222,6 +223,19 @@ func (i *iter) process(ctx context.Context) (ret bool, skip bool) {
 	return ret, skip
 }
 
+func messageTopicID(message *tg.Message, from peers.Peer) int {
+	if reply, ok := message.ReplyTo.(*tg.MessageReplyHeader); ok && reply.ForumTopic {
+		if reply.ReplyToTopID != 0 {
+			return reply.ReplyToTopID
+		}
+		return reply.ReplyToMsgID
+	}
+	if channel, ok := from.(peers.Channel); ok && channel.Raw().Forum {
+		return 1
+	}
+	return 0
+}
+
 func (i *iter) processSingle(ctx context.Context, message *tg.Message, from peers.Peer, logicalPos int) (bool, bool) {
 	item, ok := tmedia.GetMedia(message)
 	if !ok {
@@ -245,6 +259,7 @@ func (i *iter) processSingle(ctx context.Context, message *tg.Message, from peer
 	toName := bytes.Buffer{}
 	err := i.tpl.Execute(&toName, &fileTemplate{
 		DialogID:     from.ID(),
+		TopicID:      messageTopicID(message, from),
 		MessageID:    message.ID,
 		MessageDate:  int64(message.Date),
 		FileName:     item.Name,
