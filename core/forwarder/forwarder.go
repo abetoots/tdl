@@ -52,38 +52,39 @@ func New(opts Options) *Forwarder {
 
 func (f *Forwarder) Forward(ctx context.Context) error {
 	for f.opts.Iter.Next(ctx) {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		elem := f.opts.Iter.Value()
 		if _, ok := f.sent[f.tuple(elem.From(), elem.Msg())]; ok {
 			// skip grouped messages
 			continue
 		}
 
+		var grouped []*tg.Message
 		if _, ok := elem.Msg().GetGroupedID(); ok && elem.AsGrouped() {
-			grouped, err := tutil.GetGroupedMessages(ctx, f.opts.Pool.Default(ctx), elem.From().InputPeer(), elem.Msg())
+			messages, err := tutil.GetGroupedMessages(ctx, f.opts.Pool.Default(ctx), elem.From().InputPeer(), elem.Msg())
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return ctxErr
+			}
 			if err != nil {
-				if ctx.Err() != nil {
-					return err
-				}
 				f.opts.Progress.OnAdd(elem)
 				f.opts.Progress.OnDone(elem, errors.Wrapf(err, "resolve grouped message %d/%d", elem.From().ID(), elem.Msg().ID))
 				continue
 			}
-
-			if err = f.forwardMessage(ctx, elem, grouped...); err != nil {
-				continue
-			}
-
-			continue
+			grouped = messages
 		}
 
-		if err := f.forwardMessage(ctx, elem); err != nil {
-			if ctx.Err() != nil {
-				return err
-			}
-			continue
+		// forwardMessage reports individual failures through progress.
+		_ = f.forwardMessage(ctx, elem, grouped...)
+		if err := ctx.Err(); err != nil {
+			return err
 		}
 	}
 
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	return f.opts.Iter.Err()
 }
 

@@ -17,6 +17,14 @@ import (
 // ErrMessageDeleted is returned when a message is detected as deleted.
 var ErrMessageDeleted = errors.New("message may be deleted")
 
+// keep a lost connection from being treated as caller cancellation.
+func ConnectionLost(ctx context.Context, err error) error {
+	if ctx.Err() == nil && errors.Is(err, context.Canceled) {
+		return fmt.Errorf("connection lost: %v", err)
+	}
+	return err
+}
+
 // check the output because takeout only wraps the request.
 func IsFileChunk(output bin.Decoder) bool {
 	_, ok := output.(*tg.UploadFileBox)

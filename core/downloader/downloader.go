@@ -44,10 +44,7 @@ func (d *Downloader) Download(ctx context.Context, limit int) error {
 
 		wg.Go(func() error {
 			d.opts.Progress.OnAdd(elem)
-			err := d.download(wgctx, elem)
-			if errors.Is(err, context.Canceled) && ctx.Err() == nil {
-				err = errors.Errorf("connection lost: %v", err)
-			}
+			err := tutil.ConnectionLost(ctx, d.download(wgctx, elem))
 			d.opts.Progress.OnDone(elem, err)
 
 			if err == nil {
@@ -65,15 +62,13 @@ func (d *Downloader) Download(ctx context.Context, limit int) error {
 		})
 	}
 
-	workerErr := wg.Wait()
+	// worker errors only occur after caller cancellation.
+	_ = wg.Wait()
 	if err := ctx.Err(); err != nil {
 		return err
 	}
 	if err := d.opts.Iter.Err(); err != nil {
 		return errors.Wrap(err, "iter")
-	}
-	if workerErr != nil {
-		return workerErr
 	}
 	if count := failed.Load(); count > 0 {
 		return errors.Errorf("%d file(s) failed to download", count)

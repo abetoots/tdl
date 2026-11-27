@@ -55,6 +55,7 @@ func TestDefaultMiddlewaresDownloadRefusedChunk(t *testing.T) {
 	rpcErr := tgerr.New(500, rpcCallFail)
 	timeoutErr := tgerr.New(500, tg.ErrTimeout)
 	transportErr := fmt.Errorf("chunk transport timed out: %w", context.DeadlineExceeded)
+	netTimeout := &net.DNSError{Err: "chunk network timed out", IsTimeout: true}
 	for _, tt := range []struct {
 		name    string
 		wrapped bool
@@ -65,6 +66,7 @@ func TestDefaultMiddlewaresDownloadRefusedChunk(t *testing.T) {
 		{name: "takeout_rpc", wrapped: true, refusal: rpcErr},
 		{name: "takeout_timeout", wrapped: true, refusal: timeoutErr},
 		{name: "takeout_transport_timeout", wrapped: true, refusal: transportErr},
+		{name: "takeout_net_timeout", wrapped: true, refusal: netTimeout},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			for _, parallel := range []bool{false, true} {

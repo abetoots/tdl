@@ -107,6 +107,30 @@ func TestRetryPreservesLastFailureAtDeadline(t *testing.T) {
 	})
 }
 
+func TestRetryPreservesFailureFromCallEndingAfterDeadline(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+		defer cancel()
+		calls := 0
+		next := telegram.InvokeFunc(func(ctx context.Context, _ bin.Encoder, _ bin.Decoder) error {
+			calls++
+			<-ctx.Done()
+			return tgerr.New(500, rpcCallFail)
+		})
+		start := time.Now()
+		err := New(5).Handle(next)(ctx, &tg.UploadGetFileRequest{}, &tg.UploadFileBox{})
+		if !errors.Is(err, context.DeadlineExceeded) || !strings.Contains(err.Error(), rpcCallFail) {
+			t.Errorf("Invoke error = %v, want a deadline including %s", err, rpcCallFail)
+		}
+		if _, ok := tgerr.As(err); ok {
+			t.Errorf("Invoke error = %v, still a Telegram error", err)
+		}
+		if elapsed := time.Since(start); calls != 1 || elapsed != time.Second {
+			t.Errorf("Invoke made %d calls in %v, want 1 in 1s", calls, elapsed)
+		}
+	})
+}
+
 func TestRetrySucceedsOnThirdAttempt(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		calls := 0
