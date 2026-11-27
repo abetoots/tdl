@@ -289,17 +289,25 @@ func TestTakeoutConcurrentCallers(t *testing.T) {
 			p := newPool(api, 1)
 			ctx := t.Context()
 			var wg sync.WaitGroup
-			for range 8 {
-				wg.Go(func() {
-					_, _ = p.Takeout(ctx, 2).HelpGetConfig(ctx)
-				})
-			}
+			wg.Go(func() {
+				_, _ = p.Takeout(ctx, 2).HelpGetConfig(ctx)
+			})
 			select {
 			case <-entered:
 			case <-time.After(2 * time.Second):
 				t.Fatal("takeout init never started")
 			}
-			time.Sleep(20 * time.Millisecond)
+
+			const followers = 7
+			var arrivals sync.WaitGroup
+			arrivals.Add(followers)
+			for range followers {
+				wg.Go(func() {
+					arrivals.Done()
+					_, _ = p.Takeout(ctx, 2).HelpGetConfig(ctx)
+				})
+			}
+			arrivals.Wait()
 			close(gate)
 
 			done := make(chan struct{})

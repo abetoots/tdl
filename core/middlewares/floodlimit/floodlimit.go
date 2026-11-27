@@ -1,7 +1,9 @@
+// package floodlimit guards file-chunk reads against gotd's retry loops.
 package floodlimit
 
 import (
 	"context"
+	"net"
 	"time"
 
 	"github.com/go-faster/errors"
@@ -9,19 +11,29 @@ import (
 	"github.com/gotd/td/telegram"
 	"github.com/gotd/td/tg"
 	"github.com/gotd/td/tgerr"
+
+	"github.com/iyear/tdl/core/util/tutil"
 )
 
 func New(maxRetries uint) telegram.Middleware {
 	return telegram.MiddlewareFunc(func(next tg.Invoker) telegram.InvokeFunc {
 		return func(ctx context.Context, input bin.Encoder, output bin.Decoder) error {
-			// takeout wraps the input and leaves the file-chunk decoder intact.
-			_, fileChunk := output.(*tg.UploadFileBox)
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			fileChunk := tutil.IsFileChunk(output)
 			var waits uint
 			var timer *time.Timer
 			for {
 				err := next.Invoke(ctx, input, output)
+				if ctxErr := ctx.Err(); ctxErr != nil {
+					return ctxErr
+				}
 				delay, ok := tgerr.AsFloodWait(err)
 				if !ok {
+					if fileChunk && err != nil && isRetryableTimeout(err) {
+						return errors.Errorf("file chunk failed: %v", err)
+					}
 					return err
 				}
 
@@ -52,4 +64,12 @@ func New(maxRetries uint) telegram.Middleware {
 			}
 		}
 	})
+}
+
+func isRetryableTimeout(err error) bool {
+	if tgerr.Is(err, tg.ErrTimeout) || errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	var netErr net.Error
+	return errors.As(err, &netErr) && netErr.Timeout()
 }
